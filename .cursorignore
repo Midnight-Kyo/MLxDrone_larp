@@ -1,0 +1,40 @@
+# Cursor indexing — keep code and small docs; skip bulk data and binaries.
+# Syntax matches .gitignore.
+
+# Python environments & caches
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Training / inference data (images, parquet, HaGRID, YOLO training trees)
+gesture_drone/dataset/
+gesture_drone/dataset_cropped/
+gesture_drone/external/
+gesture_drone/hagrid_detection/
+
+# Model weights & MediaPipe assets (large binaries)
+gesture_drone/models/
+*.pt
+*.pth
+*.onnx
+*.engine
+*.task
+
+# Session outputs
+gesture_drone/logs/*.csv
+
+# Download / training logs (can be huge)
+gesture_drone/hagrid_download.log
+**/runs/
+
+# Secrets
+.env
+.env.*
+
+# OS / editor noise
+.DS_Store
+Thumbs.db

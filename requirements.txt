@@ -1,0 +1,22 @@
+# MLxDrone — Python 3.10+ (3.10–3.12 recommended on Windows for inference stack).
+# Install in a virtual environment.
+#
+# GPU (optional, faster): install a CUDA build of PyTorch first, then run:
+#   pip install -r requirements.txt
+# See: https://pytorch.org/get-started/locally/
+# Example (CUDA 12.4): pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+
+torch>=2.4.0
+torchvision>=0.19.0
+numpy>=1.26.0,<3
+opencv-python>=4.8.0,<5
+ultralytics>=8.3.0,<9
+djitellopy>=2.5.0
+mediapipe>=0.10.0
+huggingface-hub>=0.20.0
+PyYAML>=6.0
+requests>=2.31.0
+Pillow>=10.0.0
+matplotlib>=3.8.0
+tqdm>=4.65.0
+pyarrow>=14.0.0

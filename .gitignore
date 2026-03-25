@@ -1,0 +1,75 @@
+# --- Python ---
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+pip-wheel-metadata/
+
+# --- Secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Datasets & training corpora (large; never commit) ---
+gesture_drone/dataset/
+gesture_drone/dataset_cropped/
+gesture_drone/external/
+gesture_drone/hagrid_detection/
+
+# --- Session / telemetry outputs ---
+gesture_drone/logs/*.csv
+
+# --- One-off or bulk download logs ---
+gesture_drone/hagrid_download.log
+*.log
+
+# --- Model weights & large inference assets ---
+# YuNet (~230 KiB) may be vendored or auto-downloaded; allow only this ONNX name.
+*.pt
+*.pth
+*.onnx
+!gesture_drone/models/face_detection_yunet_2023mar.onnx
+*.engine
+*.task
+*.safetensors
+*.bin
+*.ckpt
+
+# --- Ultralytics / YOLO run directories ---
+**/runs/
+**/wandb/
+.mlflow/
+
+# --- Jupyter / tooling ---
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# --- Media / exports (optional local captures) ---
+*.mp4
+*.avi
+*.mkv
+exports/
+
+# --- ROS2 colcon (if workspace is ever vendored under repo) ---
+log/
+install/

@@ -108,6 +108,11 @@ Unchanged: **114,060 / 28,707** train/val in `dataset_cropped/` (4 classes + HaG
 
 ## Recent Changes (chronological summary)
 
+### 2026-03-26 — Tello preview: PowerShell arg forwarding + debug handoff
+- **`tello`** function in **`Load-PowerShellAliases.ps1`** uses **`ValueFromRemainingArguments`** so `tello --enhance-stream` / **`tello -E`** reliably reaches Python (plain `@args` could drop flags in some profiles).
+- **`tello_view.py`:** always prints **`[flags] enhance_stream=...`** after banner; **`-E`** alias for **`--enhance-stream`**.
+- **`gesture_drone/docs/TELLO_VIEW_DEBUG_HANDOFF.md`** — share with others: UTF-8 UDP noise, command skew, enhance flag checks, minimal status bundle.
+
 ### 2026-03-26 — `tello_view.py`: Tello stream + TrustedHand tuning (preview only)
 - **Video:** `set_video_resolution(720P)`, `set_video_fps(30)`, `set_video_bitrate(5Mbps)` after connect, before **`streamon()`** (errors logged, non-fatal). Implemented in **`tello_view.main()`** only (bridge/sim unchanged).
 - **Perception:** **`trusted_hand_config_tello_camera()`** in **`perception_gating.py`** — softer HandLandmarker confidences, higher **`mp_infer_min_side`**, slightly lower **`mp_min_landmarks`**, relaxed temporal defaults; **`tello_view.init_perception`** uses **`dataclasses.replace`** with **`--k-create` / `--mp-miss-drop` / `--no-box-drop`** overrides. Any script that calls **`init_perception`** (e.g. **`tello_real_autonomy_v1`**, **`tello_real_flight_test`**) gets the same Tello MediaPipe preset.

@@ -110,6 +110,7 @@ def add_preview_arguments(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument("--no-box-drop", type=int, default=5, help="Trusted-hand no-box drop.")
     p.add_argument(
+        "-E",
         "--enhance-stream",
         action="store_true",
         help="Cheap preprocessing: bilateral denoise + unsharp on each frame before perception.",
@@ -433,6 +434,12 @@ def main():
     print("=" * 50)
     print("  TELLO GESTURE VIEWER  (same perception stack as simulate_drone)")
     print("=" * 50)
+    print()
+    print(
+        f"  [flags] enhance_stream={args.enhance_stream}  "
+        f"(if False but you passed --enhance-stream, the shell dropped args; see "
+        f"gesture_drone/docs/TELLO_VIEW_DEBUG_HANDOFF.md)"
+    )
     print()
 
     perception = init_perception(args)

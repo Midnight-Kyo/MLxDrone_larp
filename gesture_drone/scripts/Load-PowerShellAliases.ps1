@@ -32,8 +32,19 @@ function global:bridge {
 }
 
 function global:tello {
+    # ValueFromRemainingArguments: reliably forward `tello --enhance-stream` / `tello -E`
+    # (plain `$args` can fail depending on profile / PS version).
+    param(
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [string[]] $Passthrough
+    )
     $py = Get-MlxPython
-    & $py (Join-Path $script:MLxScripts "tello_view.py") @args
+    $path = Join-Path $script:MLxScripts "tello_view.py"
+    if ($null -ne $Passthrough -and $Passthrough.Count -gt 0) {
+        & $py $path @Passthrough
+    } else {
+        & $py $path
+    }
 }
 
 function global:tello-realtest {
@@ -62,6 +73,7 @@ MLxDrone commands (after loading Load-PowerShellAliases.ps1):
   simulate 1
 
   tello              Tello camera HUD only (no ROS)
+  tello --enhance-stream   or   tello -E   Bilateral + unsharp + ENHANCED HUD badge
   tello-realtest     Real Tello: takeoff → hover → you type land (djitellopy, no ROS)
   tello-autonomy     Real Tello v1: SEARCH → FACE_LOCK (yaw) → open palm land (no ROS)
 

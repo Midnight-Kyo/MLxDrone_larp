@@ -6,8 +6,9 @@ Live gesture recognition using the **Tello camera** — **same perception stack 
 softer on compressed drone video than bridge/webcam). Use ``--no-perception-gate`` or
 ``MLX_GESTURE_PERCEPTION_GATE=0`` only to disable.
 
-After **connect**, requests **720p / 30 fps / 5 Mbps** before **streamon**. Optional
-``--enhance-stream``: cheap bilateral denoise + unsharp on each frame.
+After **connect**, requests **720p / 30 fps / 5 Mbps** before **streamon** (each command is tried
+separately; some firmware rejects ``setresolution``). Optional ``--enhance-stream``: bilateral +
+unsharp on each frame; cyan **ENHANCED** badge top-left on the video.
 
 **No flight commands** in this script (no ROS / TCP).
 
@@ -195,8 +196,6 @@ def run_preview_loop(
     face_detector = perception["face_detector"]
     yunet_load_error = perception["yunet_load_error"]
 
-    hud_source = f"{source_label} | Enhanced" if args.enhance_stream else source_label
-
     smoother = BboxSmoother(alpha=0.4, max_miss_frames=8)
     gfilter = GestureFilter(
         window=10,
@@ -218,7 +217,7 @@ def run_preview_loop(
 
     print("HUD running. Q = quit this window.")
     if args.enhance_stream:
-        print("  Perception input: stream enhancement ON (see HUD top-right 'Enhanced').")
+        print("  Perception input: stream enhancement ON (cyan ENHANCED badge, top-left).")
     print(
         f"GestureFilter: lock={GESTURE_LOCK_FRAMES} unlock={GESTURE_UNLOCK_FRAMES}; "
         f"conf {CONFIDENCE_THRESHOLD:.0%}; Trusted-hand: "
@@ -367,7 +366,7 @@ def run_preview_loop(
                 active_command,
                 fps,
                 gfilter,
-                source_label=hud_source,
+                source_label=source_label,
                 battery=battery,
                 temp=temp,
                 follow_preview=follow_arm,
@@ -376,6 +375,27 @@ def run_preview_loop(
                 yunet_error=yunet_load_error,
                 trust_line=trust_hud,
             )
+            if args.enhance_stream:
+                lab = "ENHANCED"
+                (_, th), _ = cv2.getTextSize(lab, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+                x0, y0 = 10, 26
+                cv2.rectangle(
+                    frame_bgr,
+                    (x0 - 2, y0 - th - 3),
+                    (x0 + tw + 2, y0 + 3),
+                    (0, 0, 0),
+                    -1,
+                )
+                cv2.putText(
+                    frame_bgr,
+                    lab,
+                    (x0, y0),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (0, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
             if (follow_arm or hover_face_scan) and face_fb is not None:
                 fx1, fy1, fx2, fy2 = face_fb
                 cv2.rectangle(frame_bgr, (fx1, fy1), (fx2, fy2), (80, 200, 255), 2)
@@ -419,7 +439,9 @@ def main():
 
     print()
     if args.enhance_stream:
-        print("  Stream enhancement: ON (bilateral + unsharp; HUD shows 'Enhanced')")
+        print(
+            "  Stream enhancement: ON (bilateral + unsharp; cyan ENHANCED badge top-left)"
+        )
         print()
     print("Connecting to Tello drone…")
     tello = Tello()
@@ -433,14 +455,22 @@ def main():
         print("  WARNING: Low battery.")
 
     print()
-    print("  Requesting video: 720p, 30 fps, 5 Mbps…")
-    try:
-        tello.set_video_resolution(Tello.RESOLUTION_720P)
-        tello.set_video_fps(Tello.FPS_30)
-        tello.set_video_bitrate(Tello.BITRATE_5MBPS)
-        print("  Video settings applied.")
-    except Exception as e:
-        print(f"  Video settings skipped ({e})")
+    print("  Requesting video: 720p, 30 fps, 5 Mbps (each command tried separately)…")
+    _vset = [
+        ("resolution 720p", lambda: tello.set_video_resolution(Tello.RESOLUTION_720P)),
+        ("fps high (30)", lambda: tello.set_video_fps(Tello.FPS_30)),
+        ("bitrate 5 Mbps", lambda: tello.set_video_bitrate(Tello.BITRATE_5MBPS)),
+    ]
+    for label, fn in _vset:
+        try:
+            fn()
+            print(f"    {label}: ok")
+        except Exception as e:
+            print(f"    {label}: skipped — {e}")
+    print(
+        "  (If resolution reports unknown command, firmware may not support it; "
+        "fps/bitrate may still apply.)"
+    )
 
     time.sleep(0.35)
 

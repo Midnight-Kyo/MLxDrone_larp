@@ -1,10 +1,10 @@
 # Project Status
 
-Last updated: 2026-03-26 (tracked model weights in git, handoff / clone notes)
+Last updated: 2026-03-26 (`hand_landmarker.task` tracked in git; docs sync)
 
 ## Self-contained clone
 
-A **fresh clone** plus **Windows venv** + `pip install -r requirements.txt` gives **`gesture_model.pt`**, **HaGRID `yolo_hands/weights/best.pt`**, and **YuNet ONNX** in **`gesture_drone/models/`** — no copying those artifacts between machines. **`.env`:** recreate locally if you rely on Hugging Face (e.g. **`HF_TOKEN`** for gated downloads / Ultralytics fallbacks). **MediaPipe `hand_landmarker.task`** is still **not** in git (one-time download per install; see root **README.md**). ROS/Gazebo side on WSL unchanged (separate workspace setup).
+A **fresh clone** plus **Windows venv** + `pip install -r requirements.txt` gives **`gesture_model.pt`**, **HaGRID `yolo_hands/weights/best.pt`**, **YuNet ONNX**, and **`hand_landmarker.task`** (MediaPipe TrustedHand) in **`gesture_drone/models/`** — no manual model file copies for the default stack. **`.env`:** recreate locally if you rely on Hugging Face (e.g. **`HF_TOKEN`** for gated downloads / Ultralytics **`hand_yolov8n.pt`** fallback). ROS/Gazebo side on WSL unchanged (separate workspace setup).
 
 ## What Works
 
@@ -104,9 +104,13 @@ Unchanged: **114,060 / 28,707** train/val in `dataset_cropped/` (4 classes + HaG
 
 ### P3 — Docs / ops
 - Keep human docs (`SIMULATION_STATUS.md`, etc.) in sync when user asks.
-- `.gitignore` — datasets and most weights excluded; **core inference** checkpoints (gesture + `best.pt` + YuNet ONNX) **tracked** (see ARCHITECTURE **Models & data**).
+- `.gitignore` — datasets and most weights excluded; **default inference** bundle (gesture + `best.pt` + YuNet ONNX + **`hand_landmarker.task`**) **tracked** (see ARCHITECTURE **Models & data**).
 
 ## Recent Changes (chronological summary)
+
+### 2026-03-26 — MediaPipe `hand_landmarker.task` tracked in git
+- **Tracked:** `gesture_drone/models/hand_landmarker.task` (`.gitignore` exception for this filename only; other `*.task` remains ignored).
+- **Docs:** Root **README.md** models table; **`.ai-context/README.md`**, **ARCHITECTURE**, **STATUS** (**Self-contained clone**, checklist, repo hygiene).
 
 ### 2026-03-26 — Core model weights committed to git
 - **Tracked:** `gesture_drone/models/gesture_model.pt`, `gesture_drone/models/yolo_hands/weights/best.pt`, `gesture_drone/models/face_detection_yunet_2023mar.onnx` (surgical `.gitignore` exceptions; other `*.pt` / training trees still ignored).

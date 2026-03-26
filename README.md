@@ -35,11 +35,20 @@ $env:MLX_PYTHON = "C:\path\to\.venv\Scripts\python.exe"
 
 ### 2. Models (required for inference)
 
-**Shipped in the repo:** **`gesture_model.pt`**, **`yolo_hands/weights/best.pt`**, and **`face_detection_yunet_2023mar.onnx`** live under **`gesture_drone/models/`** after clone (no manual weight transfer for those).
+**Shipped in the repo** under **`gesture_drone/models/`** after clone:
 
-You still need **`hand_landmarker.task`** locally — MediaPipe bundle from [MediaPipe hand_landmarker](https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker) (large; remains gitignored). If **`best.pt`** is removed, the stack can use a Hugging Face **`hand_yolov8n.pt`** fallback on first use when Ultralytics is configured to download (see `gesture_bridge.py` / `hand_detection`). **`yunet_face.py`** can still download YuNet if the ONNX is missing.
+| File | Role |
+|------|------|
+| **`gesture_model.pt`** | EfficientNet gesture head |
+| **`yolo_hands/weights/best.pt`** | HaGRID-tuned hand detector |
+| **`face_detection_yunet_2023mar.onnx`** | YuNet (face vs hand + follow HUD) |
+| **`hand_landmarker.task`** | MediaPipe **Hand Landmarker** (TrustedHand gate) |
 
-Other bulky artifacts (datasets, `*.task`, `last.pt`, backup checkpoints, training runs) stay **gitignored**.
+Optional: **`hand_yolov8n.pt`** — Hugging Face fallback if **`best.pt`** is absent and Ultralytics downloads (see `gesture_bridge.py` / `hand_detection`). **`yunet_face.py`** can still fetch YuNet if the ONNX is missing.
+
+To refresh the landmarker from upstream, use [MediaPipe hand_landmarker](https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker) and replace `gesture_drone/models/hand_landmarker.task`.
+
+Other bulky artifacts (datasets, extra `*.task` files, `last.pt`, backup checkpoints, training runs) stay **gitignored**.
 
 ### 3. PowerShell helpers (optional)
 
@@ -118,7 +127,7 @@ MLxDrone_larp/
 ├── .gitignore
 ├── .ai-context/              # Compact docs for AI assistants (architecture, status)
 └── gesture_drone/
-    ├── models/               # Tracked: gesture_model.pt, yolo hands best.pt, YuNet ONNX; .task etc. local
+    ├── models/               # Tracked inference: gesture, best.pt, YuNet ONNX, hand_landmarker.task
     ├── logs/                 # Session CSVs (gitignored except .gitkeep)
     ├── docs/
     │   └── PERCEPTION_GATING_DESIGN.md

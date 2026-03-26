@@ -378,7 +378,7 @@ def run_preview_loop(
             )
             if args.enhance_stream:
                 lab = "ENHANCED"
-                (_, th), _ = cv2.getTextSize(lab, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+                (tw, th), _ = cv2.getTextSize(lab, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
                 x0, y0 = 10, 26
                 cv2.rectangle(
                     frame_bgr,

@@ -195,6 +195,8 @@ def run_preview_loop(
     face_detector = perception["face_detector"]
     yunet_load_error = perception["yunet_load_error"]
 
+    hud_source = f"{source_label} | Enhanced" if args.enhance_stream else source_label
+
     smoother = BboxSmoother(alpha=0.4, max_miss_frames=8)
     gfilter = GestureFilter(
         window=10,
@@ -215,6 +217,8 @@ def run_preview_loop(
     last_command_time = 0.0
 
     print("HUD running. Q = quit this window.")
+    if args.enhance_stream:
+        print("  Perception input: stream enhancement ON (see HUD top-right 'Enhanced').")
     print(
         f"GestureFilter: lock={GESTURE_LOCK_FRAMES} unlock={GESTURE_UNLOCK_FRAMES}; "
         f"conf {CONFIDENCE_THRESHOLD:.0%}; Trusted-hand: "
@@ -363,7 +367,7 @@ def run_preview_loop(
                 active_command,
                 fps,
                 gfilter,
-                source_label=source_label,
+                source_label=hud_source,
                 battery=battery,
                 temp=temp,
                 follow_preview=follow_arm,
@@ -414,6 +418,9 @@ def main():
     perception = init_perception(args)
 
     print()
+    if args.enhance_stream:
+        print("  Stream enhancement: ON (bilateral + unsharp; HUD shows 'Enhanced')")
+        print()
     print("Connecting to Tello drone…")
     tello = Tello()
     tello.connect()

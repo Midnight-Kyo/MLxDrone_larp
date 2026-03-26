@@ -92,11 +92,12 @@ The script resolves the repo path from **`$PSScriptRoot`** and converts paths fo
 ## Physical Tello (Windows only)
 
 1. Connect the PC to the **Tello Wi‑Fi**.
-2. **`tello_view.py`** — safe preview, no motors:
+2. **`tello_view.py`** — safe preview, no motors. Requests **720p / 30 fps / 5 Mbps** from the drone, uses **Tello-tuned TrustedHand** (softer MediaPipe thresholds, stronger crop upscale), optional **`--enhance-stream`** for mild denoise + sharpen on the feed.
 
    ```powershell
    cd gesture_drone\scripts
    python tello_view.py
+   python tello_view.py --enhance-stream
    ```
 
 3. **`tello_hover_baseline.py`** — short hover test (no RC after takeoff), then land.

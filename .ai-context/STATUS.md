@@ -1,6 +1,6 @@
 # Project Status
 
-Last updated: 2026-03-26 (`hand_landmarker.task` tracked in git; docs sync)
+Last updated: 2026-03-26 (`tello_view.py` stream quality + Tello TrustedHand preset)
 
 ## Self-contained clone
 
@@ -13,11 +13,11 @@ A **fresh clone** plus **Windows venv** + `pip install -r requirements.txt` give
 - **cmd_vel (conservative)**: Default forward/up use **`VELOCITY_FORWARD = 0.12`**, **`VELOCITY_UP = 0.10`** m/s. When **`beh_state`** is **`SEARCH`** or **`FACE_LOCK`** (fist-edge + face TCP fields), the node publishes **`angular.z`** autonomy yaw and **zero linear** translation (see **`gesture_ros2_node.py`**).
 - **TCP watchdog**: No line from Windows for **>3 s** → treat as **STOP** (zero twist when flying).
 - **2D simulator** (`simulate_drone.py`): Same perception as bridge; **HVEL/VVEL** HUD; **`--source tello`**; SessionLogger; optional **MANUAL / SEARCH / FACE_LOCK** + **`H_HOLD` “settled”** line on HUD; fist toggles autonomy in sim.
-- **Tello preview** (`tello_view.py`): **`hand_detection.detect_hand`** + TrustedHand + YuNet + GestureFilter + HUD; **no flight commands**.
+- **Tello preview** (`tello_view.py`): **`hand_detection.detect_hand`** + TrustedHand + YuNet + GestureFilter + HUD; **no flight commands**. After **`connect()`**, requests **720p / 30 fps / 5 Mbps** via djitellopy (try/except). **TrustedHand** uses **`trusted_hand_config_tello_camera()`** — lower MP detection/presence thresholds, **288px** min crop upscale, **`min_landmarks=14`**, temporal **K_CREATE=3** / **MP_MISS_DROP=7** (CLI overrides). Optional **`--enhance-stream`**: bilateral denoise + unsharp before perception.
 - **Physical Tello (djitellopy)**: **`tello_real_autonomy_v1.py`** (preview **[T]** → Enter → takeoff → SEARCH default **cw/ccw** steps → FACE_LOCK **rc** yaw → **open_palm** / **Q** / Ctrl+C land); **`tello_hover_baseline.py`** (10 s hover **no rc**); **`tello_real_flight_test.py`** (minimal flight + optional `--onboard`**).
 - **Launchers**: `launch_all.ps1` with **`-Source webcam|tello`**; repo **`Load-PowerShellAliases.ps1`** — **`drone`**, **`tello-autonomy`**, **`tello-realtest`**, etc.; add **`tello-hover`** locally if desired (see ARCHITECTURE).
 - **YOLO hands** (HaGRID `models/yolo_hands/weights/best.pt` if present, else HF **`hand_yolov8n.pt`**), **`hand_detection.detect_hand`** + **`TrustedHandGate`** (**MediaPipe** verifies YOLO crop; **on by default**; `--no-perception-gate` or `MLX_GESTURE_PERCEPTION_GATE=0` off) + **BboxSmoother** + **GestureFilter** on **`gesture_bridge.py`** and **`simulate_drone.py`**. Pre-trust: classifier may run for debug/session log **only**; `behavior_allow` gates `GestureFilter`. **Field-tested:** YOLO FPs rarely break behavior; MP structural check is conservative on non-hands; reduces need for room-specific YOLO hard negatives.
-- **`tello_view.py`:** Uses **`hand_detection.detect_hand`** + **TrustedHandGate** + YuNet (aligned with bridge/sim perception path).
+- **`tello_view.py`:** Uses **`hand_detection.detect_hand`** + **TrustedHandGate** (Tello-tuned config) + YuNet; bridge/sim still use generic **`TrustedHandConfig`** unless changed later.
 - **YuNet** (`yunet_face.py`): On **bridge** and **sim**, used for **face-vs-hand overlap rejection** when loaded + **proximity HUD** while follow / `two_fingers` is active (see ARCHITECTURE). **No extra follow `cmd_vel`** — preview only. ONNX **`face_detection_yunet_2023mar.onnx`** is **tracked in repo** under `gesture_drone/models/`; **HF download** only if the file is missing/corrupt.
 - **Training/data pipeline**, **GPU Gazebo** (WSLg d3d12), **URDF/visual** improvements — unchanged from prior status.
 
@@ -107,6 +107,12 @@ Unchanged: **114,060 / 28,707** train/val in `dataset_cropped/` (4 classes + HaG
 - `.gitignore` — datasets and most weights excluded; **default inference** bundle (gesture + `best.pt` + YuNet ONNX + **`hand_landmarker.task`**) **tracked** (see ARCHITECTURE **Models & data**).
 
 ## Recent Changes (chronological summary)
+
+### 2026-03-26 — `tello_view.py`: Tello stream + TrustedHand tuning (preview only)
+- **Video:** `set_video_resolution(720P)`, `set_video_fps(30)`, `set_video_bitrate(5Mbps)` after connect, before **`streamon()`** (errors logged, non-fatal). Implemented in **`tello_view.main()`** only (bridge/sim unchanged).
+- **Perception:** **`trusted_hand_config_tello_camera()`** in **`perception_gating.py`** — softer HandLandmarker confidences, higher **`mp_infer_min_side`**, slightly lower **`mp_min_landmarks`**, relaxed temporal defaults; **`tello_view.init_perception`** uses **`dataclasses.replace`** with **`--k-create` / `--mp-miss-drop` / `--no-box-drop`** overrides. Any script that calls **`init_perception`** (e.g. **`tello_real_autonomy_v1`**, **`tello_real_flight_test`**) gets the same Tello MediaPipe preset.
+- **Optional:** **`--enhance-stream`** — cheap bilateral + unsharp on each frame (no deep SR); **`tello_view`** only.
+- **Docs:** **STATUS** (this file); **ARCHITECTURE**; root **README** Tello preview blurb.
 
 ### 2026-03-26 — MediaPipe `hand_landmarker.task` tracked in git
 - **Tracked:** `gesture_drone/models/hand_landmarker.task` (`.gitignore` exception for this filename only; other `*.task` remains ignored).

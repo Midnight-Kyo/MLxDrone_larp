@@ -2,7 +2,7 @@
 
 ## System Overview
 
-Two machines, one pipeline. Video input is either a **PC webcam** or the **Tello camera**. **Bridge, sim, and `tello_view`** share **`hand_detection.detect_hand`** (same YOLO weights table and TrustedHand path; see Inference Pipeline). **Physical** scripts reuse **`tello_view.init_perception`** where noted.
+Two machines, one pipeline. Video input is either a **PC webcam** or the **Tello camera**. **Bridge, sim, and `tello_view`** share **`hand_detection.detect_hand`** (same YOLO weights table). **TrustedHand:** bridge/sim use default **`TrustedHandConfig`**; **`tello_view.init_perception`** (and scripts that call it) uses **`trusted_hand_config_tello_camera()`** for compressed Tello video. **Physical** scripts reuse **`tello_view.init_perception`** where noted.
 
 ```
 WINDOWS (GPU inference)                    WSL2 (Ubuntu 22.04, ROS2 + Gazebo)
@@ -26,7 +26,7 @@ WINDOWS (GPU inference)                    WSL2 (Ubuntu 22.04, ROS2 + Gazebo)
 
 **2D simulator** (`simulate_drone.py`): same perception chain; commands drive a **virtual** top-down panel (no TCP). Optional `--source tello`. Optional **fist-toggle** **MANUAL / SEARCH / FACE_LOCK** on sim **heading** (see script; YuNet + `search_behavior`).
 
-**Tello HUD only** (`tello_view.py`): **shared `hand_detection.detect_hand`** + **TrustedHandGate** + YuNet + GestureFilter (aligned with bridge/sim). **No** TCP, **no** motors — display and screenshots only.
+**Tello HUD only** (`tello_view.py`): **shared `hand_detection.detect_hand`** + **TrustedHandGate** (Tello-tuned config via **`trusted_hand_config_tello_camera()`**) + YuNet + GestureFilter. On connect: **720p / 30 fps / 5 Mbps** (`djitellopy`), optional **`--enhance-stream`** (bilateral + unsharp). **No** TCP, **no** motors — display and screenshots only.
 
 **Physical Tello (djitellopy, no ROS in repo for flight control):**
 
@@ -175,7 +175,7 @@ Inference scripts **auto-pick** `best.pt` when the file exists.
 | `launch_gazebo_bridge.sh` | WSL2 | Gazebo + `gesture_ros2_node`. `--no-windows` when launched from `launch_all.ps1`. |
 | `launch_all.ps1` | Windows | WSL window + wait on :9090 + `gesture_bridge.py`. **`-CameraIndex`** (default 2), **`-Source {webcam,tello}`**. |
 | `simulate_drone.py` | Windows | 2D sim + `hand_detection` + SessionLogger + scale HUD + `--source` / `--world-width-m`; optional **SEARCH / FACE_LOCK** on heading. |
-| `tello_view.py` | Windows | Tello stream + **`hand_detection.detect_hand`** + TrustedHand + gestures; **display only**. |
+| `tello_view.py` | Windows | Tello stream (max video settings before **`streamon`**) + **`hand_detection`** + Tello-tuned TrustedHand + gestures; **`--enhance-stream`** optional; **display only**. |
 | `tello_real_autonomy_v1.py` | Windows | **Physical** djitellopy: preview → takeoff → SEARCH / FACE_LOCK → land; no ROS. |
 | `tello_hover_baseline.py` | Windows | **Physical** djitellopy: takeoff → 10 s hover (**no rc**) → land. |
 | `tello_real_flight_test.py` | Windows | **Physical** djitellopy: minimal takeoff/hover/land; optional `--onboard` HUD. |

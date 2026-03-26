@@ -1,8 +1,13 @@
 r"""
 Live gesture recognition using the **Tello camera** — **same perception stack as**
 ``simulate_drone.py`` / ``gesture_bridge.py``: ``hand_detection`` + **TrustedHandGate** (MediaPipe)
-+ **YuNet** + **GestureFilter** + follow latch. **Trusted-hand is ON by default** (same as sim);
-use ``--no-perception-gate`` or ``MLX_GESTURE_PERCEPTION_GATE=0`` only to disable.
++ **YuNet** + **GestureFilter** + follow latch. **Trusted-hand is ON by default** with
+**Tello-tuned** MediaPipe thresholds / crop upscale (``trusted_hand_config_tello_camera`` —
+softer on compressed drone video than bridge/webcam). Use ``--no-perception-gate`` or
+``MLX_GESTURE_PERCEPTION_GATE=0`` only to disable.
+
+After **connect**, requests **720p / 30 fps / 5 Mbps** before **streamon**. Optional
+``--enhance-stream``: cheap bilateral denoise + unsharp on each frame.
 
 **No flight commands** in this script (no ROS / TCP).
 
@@ -23,21 +28,23 @@ from __future__ import annotations
 
 import argparse
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import cv2
+import numpy as np
 from djitellopy import Tello
 
 import hand_detection
 from hand_detection import detect_hand
 from perception_gating import (
-    TrustedHandConfig,
     TrustedHandGate,
     describe_gate_load_failure,
     format_trust_hud_line,
     load_hand_landmarker,
     perception_gate_wanted,
+    trusted_hand_config_tello_camera,
 )
 from simulate_drone import (
     BboxSmoother,
@@ -72,16 +79,40 @@ MODEL_DIR = SCRIPT_DIR.parent / "models"
 FACE_HAND_IOU_MAX = 0.22
 
 
+def enhance_tello_frame_bgr(frame_bgr: np.ndarray) -> np.ndarray:
+    """Mild bilateral denoise + unsharp for compressed Tello video (cheap, real-time)."""
+    if frame_bgr is None or frame_bgr.size == 0:
+        return frame_bgr
+    bgr = cv2.bilateralFilter(frame_bgr, d=5, sigmaColor=40, sigmaSpace=40)
+    blur = cv2.GaussianBlur(bgr, (0, 0), 1.0)
+    return cv2.addWeighted(bgr, 1.25, blur, -0.25, 0)
+
+
 def add_preview_arguments(p: argparse.ArgumentParser) -> None:
     """Same perception CLI as ``simulate_drone`` / onboard flight test."""
     p.add_argument(
         "--no-perception-gate",
         action="store_true",
-        help="Disable TrustedHand (MediaPipe). Default: gate ON (matches simulate_drone).",
+        help="Disable TrustedHand (MediaPipe). Default: gate ON (Tello-tuned thresholds).",
     )
-    p.add_argument("--k-create", type=int, default=4, help="Trusted-hand K_CREATE.")
-    p.add_argument("--mp-miss-drop", type=int, default=5, help="Trusted-hand MP miss drop.")
+    p.add_argument(
+        "--k-create",
+        type=int,
+        default=3,
+        help="Trusted-hand K_CREATE (default matches Tello-tuned preset).",
+    )
+    p.add_argument(
+        "--mp-miss-drop",
+        type=int,
+        default=7,
+        help="Trusted-hand MP miss drop (default matches Tello-tuned preset).",
+    )
     p.add_argument("--no-box-drop", type=int, default=5, help="Trusted-hand no-box drop.")
+    p.add_argument(
+        "--enhance-stream",
+        action="store_true",
+        help="Cheap preprocessing: bilateral denoise + unsharp on each frame before perception.",
+    )
 
 
 def parse_args():
@@ -99,7 +130,8 @@ def init_perception(args: Any) -> dict[str, Any]:
     detector = load_hand_detector()
     tgate = None
     if perception_gate_wanted(args.no_perception_gate):
-        tcfg = TrustedHandConfig(
+        tcfg = replace(
+            trusted_hand_config_tello_camera(),
             k_create=args.k_create,
             mp_miss_drop=args.mp_miss_drop,
             no_box_drop=args.no_box_drop,
@@ -107,10 +139,18 @@ def init_perception(args: Any) -> dict[str, Any]:
         lm = load_hand_landmarker(MODEL_DIR, tcfg)
         if lm is not None:
             tgate = TrustedHandGate(lm, tcfg)
-            print("  Trusted-hand gate: ON (YOLO + MediaPipe) — same default as simulate_drone")
+            print(
+                "  Trusted-hand gate: ON — Tello-tuned MediaPipe (low bitrate / H.264)"
+            )
             print(
                 f"    K_CREATE={tcfg.k_create} MP_MISS_DROP={tcfg.mp_miss_drop} "
                 f"NO_BOX_DROP={tcfg.no_box_drop}"
+            )
+            print(
+                f"    MP_crop_min_side={tcfg.mp_infer_min_side} "
+                f"mp_det={tcfg.mp_min_hand_detection_confidence:.2f} "
+                f"mp_pres={tcfg.mp_min_hand_presence_confidence:.2f} "
+                f"min_lm={tcfg.mp_min_landmarks}"
             )
         else:
             print(f"  Trusted-hand gate: OFF — {describe_gate_load_failure(MODEL_DIR)}")
@@ -187,6 +227,9 @@ def run_preview_loop(
             if frame_bgr is None or frame_bgr.size == 0:
                 time.sleep(0.01)
                 continue
+
+            if args.enhance_stream:
+                frame_bgr = enhance_tello_frame_bgr(frame_bgr)
 
             if time.time() - telem_timer > 3.0:
                 try:
@@ -381,6 +424,18 @@ def main():
 
     if battery < 15:
         print("  WARNING: Low battery.")
+
+    print()
+    print("  Requesting video: 720p, 30 fps, 5 Mbps…")
+    try:
+        tello.set_video_resolution(Tello.RESOLUTION_720P)
+        tello.set_video_fps(Tello.FPS_30)
+        tello.set_video_bitrate(Tello.BITRATE_5MBPS)
+        print("  Video settings applied.")
+    except Exception as e:
+        print(f"  Video settings skipped ({e})")
+
+    time.sleep(0.35)
 
     print()
     print("Starting video stream…")

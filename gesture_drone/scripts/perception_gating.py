@@ -2,7 +2,9 @@
 Unified v1 trusted-hand policy: YOLO owns the crop; MediaPipe verifies a real hand
 in that crop; temporal rules gate behavior (not debug classification).
 
-Configurable: K_CREATE, MP_MISS_DROP, NO_BOX_DROP (see TrustedHandConfig).
+Configurable: K_CREATE, MP_MISS_DROP, NO_BOX_DROP and MediaPipe thresholds (see
+``TrustedHandConfig``). Use ``trusted_hand_config_tello_camera()`` for compressed
+Tello Wi‑Fi video (lower MP confidences, higher crop upscale).
 """
 
 from __future__ import annotations
@@ -35,6 +37,25 @@ class TrustedHandConfig:
     # HandLandmarker detection thresholds (verification path; can be lower than dataset tools).
     mp_min_hand_detection_confidence: float = 0.15
     mp_min_hand_presence_confidence: float = 0.15
+
+
+def trusted_hand_config_tello_camera() -> TrustedHandConfig:
+    """
+    TrustedHand defaults tuned for Ryze/DJI Tello camera (H.264, low bitrate).
+
+    Softer HandLandmarker thresholds and stronger YOLO-crop upscale before MP reduce
+    false ``mp_no_hand`` / low landmark counts on noisy streams (e.g. fist).
+    Temporal knobs are slightly more forgiving than generic webcam defaults.
+    """
+    return TrustedHandConfig(
+        k_create=3,
+        mp_miss_drop=7,
+        no_box_drop=5,
+        mp_min_landmarks=14,
+        mp_infer_min_side=288,
+        mp_min_hand_detection_confidence=0.10,
+        mp_min_hand_presence_confidence=0.10,
+    )
 
 
 @dataclass

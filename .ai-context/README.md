@@ -41,7 +41,7 @@ Perception can use a **PC webcam** or the **Tello camera** (`--source tello` on 
 ## Repo hygiene (indexing / git)
 
 - **`.cursorignore`** -- Excludes datasets, weights, logs, `runs/`, etc. from Cursor codebase indexing.
-- **`.gitignore`** -- Broad patterns for `*.pt`, `hagrid_detection/`, datasets, logs (keep local bulk data out of git).
+- **`.gitignore`** -- Datasets, `hagrid_detection/`, most `*.pt` / `*.onnx` / `*.task`, logs, `runs/`. **Tracked exceptions:** `gesture_drone/models/gesture_model.pt`, `gesture_drone/models/yolo_hands/weights/best.pt`, `gesture_drone/models/face_detection_yunet_2023mar.onnx` so a fresh clone has core inference weights without manual file copies.
 
 ## Update Protocol
 
@@ -55,7 +55,7 @@ After completing any task:
 ## Handoff quickstart
 
 1. Read **PERSONALITY.md**, then **ARCHITECTURE.md**, then **STATUS.md** (this folder).
-2. **Two runtimes:** gesture inference and physical **djitellopy** scripts run on **Windows** (project venv + `requirements.txt`). **ROS 2 + Gazebo** run in **WSL2 Ubuntu 22.04** — not the same Python as Windows (details in ARCHITECTURE **Environment setup**).
+2. **Two runtimes:** gesture inference and physical **djitellopy** scripts run on **Windows** (project venv + `requirements.txt`). **ROS 2 + Gazebo** run in **WSL2 Ubuntu 22.04** — not the same Python as Windows (details in ARCHITECTURE **Environment setup**). Core gesture / YOLO-hand / YuNet weights are **in git** under `gesture_drone/models/`; you still need **`hand_landmarker.task`** locally (see root **README.md**).
 3. **No motors:** verify perception with **`simulate_drone.py`** (2D) or **`tello_view.py`** (Tello HUD only) before caring about Gazebo or physical flight.
 4. **Simulated drone:** **`drone`** / **`launch_all.ps1`** — Windows bridge → TCP **:9090** → WSL **`gesture_ros2_node.py`** + Gazebo (ARCHITECTURE **Running**).
 5. **Physical Tello:** run **`tello_hover_baseline.py`** (hover, no RC) before **`tello_real_autonomy_v1.py`**; read ARCHITECTURE **Physical Tello — behavior and constraints** and **Troubleshooting (minimal)** first.

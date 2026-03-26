@@ -159,7 +159,7 @@ Inference scripts **auto-pick** `best.pt` when the file exists.
 | File | Purpose |
 |------|---------|
 | `requirements.txt` | Python deps (PyTorch, OpenCV, ultralytics, djitellopy, …) |
-| `.gitignore` | venv, datasets, `*.pt`, `hagrid_detection/`, logs, `**/runs/`, … |
+| `.gitignore` | venv, datasets, `hagrid_detection/`, logs, `**/runs/`, broad `*.pt` / `*.onnx` with **exceptions** for `gesture_drone/models/gesture_model.pt`, `yolo_hands/weights/best.pt`, `face_detection_yunet_2023mar.onnx` |
 | `.cursorignore` | Same class of paths for Cursor indexing |
 | `.env` | Secrets (e.g. HF_TOKEN). Never committed. |
 | `.ai-context/` | AI context (this folder) |
@@ -189,7 +189,7 @@ Inference scripts **auto-pick** `best.pt` when the file exists.
 
 ### Models & data
 
-Same as before: `gesture_model.pt`, `yolo_hands/weights/best.pt`, datasets under `gesture_drone/` (see STATUS for paths; large trees gitignored).
+**In repo:** `gesture_drone/models/gesture_model.pt`, `gesture_drone/models/yolo_hands/weights/best.pt`, `gesture_drone/models/face_detection_yunet_2023mar.onnx` (tracked in git). **Local-only (typical):** `hand_landmarker.task`, optional `hand_yolov8n.pt` fallback, YOLO `last.pt`, backups — still gitignored. **Datasets** under `gesture_drone/` (large trees) remain gitignored; see STATUS for paths.
 
 ### ROS2 Workspace: `/root/ros2_ws/`
 
@@ -210,7 +210,7 @@ Unchanged: `pretty.world`, `pretty_launch.py`, `tello_plugin.cpp` (upstream), `t
 
 ### Checklist (minimal)
 
-- [ ] **Windows:** venv active (or `MLX_PYTHON` set), `pip install -r requirements.txt`, project weights present or downloadable (e.g. Hugging Face fallback for YOLO).
+- [ ] **Windows:** venv active (or `MLX_PYTHON` set), `pip install -r requirements.txt`; **`hand_landmarker.task`** present under `gesture_drone/models/` (download separately). Gesture / HaGRID-hand / YuNet ONNX weights ship in the repo.
 - [ ] **WSL:** workspace sourced, `colcon build` succeeded, `ros2` + Gazebo launch finds **`pretty.world`** and the gesture bridge node.
 - [ ] **Network:** Windows reaches WSL on **:9090**; for real Tello, laptop on the drone's Wi‑Fi as required by **djitellopy**.
 

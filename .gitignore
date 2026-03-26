@@ -33,7 +33,11 @@ gesture_drone/hagrid_download.log
 
 # --- Model weights & large inference assets ---
 # YuNet (~230 KiB) may be vendored or auto-downloaded; allow only this ONNX name.
+# Tracked inference checkpoints (fresh clone): gesture + HaGRID YOLO hands only.
+# Other *.pt (HF fallbacks, backups, last.pt, training outputs) stay ignored.
 *.pt
+!gesture_drone/models/gesture_model.pt
+!gesture_drone/models/yolo_hands/weights/best.pt
 *.pth
 *.onnx
 !gesture_drone/models/face_detection_yunet_2023mar.onnx

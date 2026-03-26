@@ -35,16 +35,11 @@ $env:MLX_PYTHON = "C:\path\to\.venv\Scripts\python.exe"
 
 ### 2. Models (required for inference)
 
-Place files under **`gesture_drone/models/`** (create the folder if needed; a `.gitkeep` is tracked):
+**Shipped in the repo:** **`gesture_model.pt`**, **`yolo_hands/weights/best.pt`**, and **`face_detection_yunet_2023mar.onnx`** live under **`gesture_drone/models/`** after clone (no manual weight transfer for those).
 
-| File | Purpose |
-|------|---------|
-| **`gesture_model.pt`** | Trained EfficientNet checkpoint (`train_model.py` or your own). |
-| **`hand_landmarker.task`** | MediaPipe hand landmarker — e.g. [MediaPipe hand_landmarker](https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker) (download the `.task` bundle). |
-| **Hand detector** | Either **`gesture_drone/models/yolo_hands/weights/best.pt`** (fine-tuned) **or** **`hand_yolov8n.pt`** — the stack downloads a Hugging Face fallback on first use if Ultralytics is configured to do so (see `gesture_bridge.py` / `hand_detection` loaders). |
-| **`face_detection_yunet_2023mar.onnx`** | Optional; YuNet is **auto-downloaded** by `yunet_face.py` if missing. |
+You still need **`hand_landmarker.task`** locally — MediaPipe bundle from [MediaPipe hand_landmarker](https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker) (large; remains gitignored). If **`best.pt`** is removed, the stack can use a Hugging Face **`hand_yolov8n.pt`** fallback on first use when Ultralytics is configured to download (see `gesture_bridge.py` / `hand_detection`). **`yunet_face.py`** can still download YuNet if the ONNX is missing.
 
-Large `.pt` / `.task` files are **gitignored**; they are not stored in the repo.
+Other bulky artifacts (datasets, `*.task`, `last.pt`, backup checkpoints, training runs) stay **gitignored**.
 
 ### 3. PowerShell helpers (optional)
 
@@ -123,7 +118,7 @@ MLxDrone_larp/
 ├── .gitignore
 ├── .ai-context/              # Compact docs for AI assistants (architecture, status)
 └── gesture_drone/
-    ├── models/               # Local weights (.pt, .task — not in git; see table above)
+    ├── models/               # Tracked: gesture_model.pt, yolo hands best.pt, YuNet ONNX; .task etc. local
     ├── logs/                 # Session CSVs (gitignored except .gitkeep)
     ├── docs/
     │   └── PERCEPTION_GATING_DESIGN.md

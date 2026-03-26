@@ -1,6 +1,10 @@
 # Project Status
 
-Last updated: 2026-03-26 (`.ai-context` handoff quickstart, env, troubleshooting, physical constraints)
+Last updated: 2026-03-26 (tracked model weights in git, handoff / clone notes)
+
+## Self-contained clone
+
+A **fresh clone** plus **Windows venv** + `pip install -r requirements.txt` gives **`gesture_model.pt`**, **HaGRID `yolo_hands/weights/best.pt`**, and **YuNet ONNX** in **`gesture_drone/models/`** — no copying those artifacts between machines. **`.env`:** recreate locally if you rely on Hugging Face (e.g. **`HF_TOKEN`** for gated downloads / Ultralytics fallbacks). **MediaPipe `hand_landmarker.task`** is still **not** in git (one-time download per install; see root **README.md**). ROS/Gazebo side on WSL unchanged (separate workspace setup).
 
 ## What Works
 
@@ -14,7 +18,7 @@ Last updated: 2026-03-26 (`.ai-context` handoff quickstart, env, troubleshooting
 - **Launchers**: `launch_all.ps1` with **`-Source webcam|tello`**; repo **`Load-PowerShellAliases.ps1`** — **`drone`**, **`tello-autonomy`**, **`tello-realtest`**, etc.; add **`tello-hover`** locally if desired (see ARCHITECTURE).
 - **YOLO hands** (HaGRID `models/yolo_hands/weights/best.pt` if present, else HF **`hand_yolov8n.pt`**), **`hand_detection.detect_hand`** + **`TrustedHandGate`** (**MediaPipe** verifies YOLO crop; **on by default**; `--no-perception-gate` or `MLX_GESTURE_PERCEPTION_GATE=0` off) + **BboxSmoother** + **GestureFilter** on **`gesture_bridge.py`** and **`simulate_drone.py`**. Pre-trust: classifier may run for debug/session log **only**; `behavior_allow` gates `GestureFilter`. **Field-tested:** YOLO FPs rarely break behavior; MP structural check is conservative on non-hands; reduces need for room-specific YOLO hard negatives.
 - **`tello_view.py`:** Uses **`hand_detection.detect_hand`** + **TrustedHandGate** + YuNet (aligned with bridge/sim perception path).
-- **YuNet** (`yunet_face.py`): On **bridge** and **sim**, used for **face-vs-hand overlap rejection** when loaded + **proximity HUD** while follow / `two_fingers` is active (see ARCHITECTURE). **No extra follow `cmd_vel`** — preview only. ONNX: `face_detection_yunet_2023mar.onnx` (HF if missing).
+- **YuNet** (`yunet_face.py`): On **bridge** and **sim**, used for **face-vs-hand overlap rejection** when loaded + **proximity HUD** while follow / `two_fingers` is active (see ARCHITECTURE). **No extra follow `cmd_vel`** — preview only. ONNX **`face_detection_yunet_2023mar.onnx`** is **tracked in repo** under `gesture_drone/models/`; **HF download** only if the file is missing/corrupt.
 - **Training/data pipeline**, **GPU Gazebo** (WSLg d3d12), **URDF/visual** improvements — unchanged from prior status.
 
 ## Gesture Confirmation System
@@ -100,9 +104,13 @@ Unchanged: **114,060 / 28,707** train/val in `dataset_cropped/` (4 classes + HaG
 
 ### P3 — Docs / ops
 - Keep human docs (`SIMULATION_STATUS.md`, etc.) in sync when user asks.
-- `.cursorignore` / `.gitignore` — done for datasets and weights.
+- `.gitignore` — datasets and most weights excluded; **core inference** checkpoints (gesture + `best.pt` + YuNet ONNX) **tracked** (see ARCHITECTURE **Models & data**).
 
 ## Recent Changes (chronological summary)
+
+### 2026-03-26 — Core model weights committed to git
+- **Tracked:** `gesture_drone/models/gesture_model.pt`, `gesture_drone/models/yolo_hands/weights/best.pt`, `gesture_drone/models/face_detection_yunet_2023mar.onnx` (surgical `.gitignore` exceptions; other `*.pt` / training trees still ignored).
+- **Docs:** Root **README.md** models section; **`.ai-context/README.md`** handoff + repo hygiene; **ARCHITECTURE** (`.gitignore` row, **Models & data**, env checklist); **STATUS** (**Self-contained clone**).
 
 ### 2026-03-26 — `.ai-context` sync (physical + handoff)
 - **README / ARCHITECTURE / STATUS:** Document **physical** scripts, corrected **`tello_view`** (shared **`hand_detection`** + TrustedHand), **ROS `angular.z`** when **SEARCH / FACE_LOCK**, **simulate_drone** autonomy/HUD, **`search_behavior.py`**, PowerShell aliases vs optional **`tello-hover`** wrapper.

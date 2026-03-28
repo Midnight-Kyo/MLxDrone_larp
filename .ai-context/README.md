@@ -4,14 +4,14 @@ This folder exists for AI assistants. Read these files to understand the project
 
 ## Project in One Paragraph
 
-A hand-gesture-controlled drone system. **YOLOv8n** (HaGRID `best.pt` or HF fallback) proposes the hand box; **bridge + sim + `tello_view` / physical autonomy** run **`TrustedHandGate`** (**MediaPipe** verifies a real hand in the **YOLO crop**; temporal trust gates **behavior** while YOLO still supplies the classifier crop). Upstream: **`hand_detection.py`** (geometry, optional **YuNet**, `BboxSmoother`, square crop) — used by **bridge, sim, `tello_view`, and `tello_real_autonomy_v1`**. **EfficientNet-B0** classifies; **GestureFilter** gates commands. This stack strongly suppresses YOLO false positives **without** room-specific YOLO hard-negative retraining.
+A hand-gesture-controlled drone system. **YOLOv8n** (HaGRID `best.pt` or HF fallback) proposes the hand box; **`TrustedHandGate`** (**MediaPipe** verifies a real hand in the **YOLO crop**; temporal trust gates **behavior** while YOLO still supplies the classifier crop) runs on **bridge, sim, and `tello_view`**. **`tello_real_autonomy_v1.py`** loads the same **`init_perception`** preset but then **forces `tgate` off** and relies on stricter **`GestureFilter`** lock/unlock instead (see STATUS). Upstream: **`hand_detection.py`** (geometry, optional **YuNet**, `BboxSmoother`, square crop) — used by **bridge, sim, `tello_view`, and `tello_real_autonomy_v1`**. **EfficientNet-B0** classifies; **GestureFilter** gates commands. TrustedHand on bridge/sim/`tello_view` strongly suppresses YOLO false positives **without** room-specific YOLO hard-negative retraining.
 
 **Execution paths:**
 
 - **2D OpenCV simulator** (`simulate_drone.py`, no ROS) — optional **MANUAL / SEARCH / FACE_LOCK** on **`drone.heading`** (yaw-only sim semantics).
 - **Gazebo + ROS2** (Windows `gesture_bridge.py` → TCP → WSL2 `gesture_ros2_node.py` → `/drone1/cmd_vel` + `tello_action`) — **SEARCH / FACE_LOCK** via **`angular.z`** when fist-edge + face fields drive autonomy on the **simulated** drone.
 - **Tello camera preview** (`tello_view.py`) — **no** flight; same perception stack as sim/bridge (Shared **`hand_detection`**, TrustedHand, YuNet).
-- **Physical Tello (djitellopy, no ROS):** **`tello_real_autonomy_v1.py`** — preview → takeoff → **SEARCH** (default **cw/ccw** SDK steps; optional **`--search-mode rc`**) → **FACE_LOCK** (**`send_rc_control`** yaw only) → land on confirmed **open_palm** / **Q** / Ctrl+C. **`tello_hover_baseline.py`** — connect, takeoff, **10 s hover, no RC**, land (stability sanity check). **`tello_real_flight_test.py`** — minimal takeoff/hover/land and optional onboard HUD.
+- **Physical Tello (djitellopy, no ROS):** **`tello_real_autonomy_v1.py`** — preview → takeoff → **SEARCH** (default **cw/ccw** SDK steps; optional **`--search-mode rc`**) → **FACE_LOCK** (**`send_rc_control`** yaw only) → land on confirmed **open_palm** / **Q** / Ctrl+C; **no TrustedHand**; **`AUTONOMY_GESTURE_*` 19/25** (see STATUS). **`tello_hover_baseline.py`** — connect, takeoff, **10 s hover, no RC**, land (stability sanity check). **`tello_real_flight_test.py`** — minimal takeoff/hover/land and optional onboard HUD.
 
 Perception can use a **PC webcam** or the **Tello camera** (`--source tello` on `gesture_bridge.py` and `simulate_drone.py`; Gazebo via `launch_all.ps1 -Source tello` or `drone -Tello`). Pipeline spans **Windows** (inference, physical Tello) and **WSL2 Ubuntu 22.04** (ROS2/Gazebo).
 
@@ -42,6 +42,7 @@ Perception can use a **PC webcam** or the **Tello camera** (`--source tello` on 
 
 - **`.cursorignore`** -- Excludes datasets, weights, logs, `runs/`, etc. from Cursor codebase indexing.
 - **`.gitignore`** -- Datasets, `hagrid_detection/`, most `*.pt` / `*.onnx` / `*.task`, logs, `runs/`. **Tracked exceptions:** `gesture_model.pt`, `yolo_hands/weights/best.pt`, `face_detection_yunet_2023mar.onnx`, `hand_landmarker.task` under `gesture_drone/models/` so a fresh clone has the full default perception stack without manual model copies.
+- **Slim workspace:** Those dataset / HaGRID prep paths may be **empty or deleted locally** after cleanup; default **inference** still uses only **`gesture_drone/models/`**. Retraining repopulates the gitignored trees (see STATUS **Dataset / training corpora**, ARCHITECTURE **Training YOLO hands**).
 
 ## Update Protocol
 

@@ -2,7 +2,7 @@
 
 ## System Overview
 
-Two machines, one pipeline. Video input is either a **PC webcam** or the **Tello camera**. **Bridge, sim, and `tello_view`** share **`hand_detection.detect_hand`** (same YOLO weights table). **TrustedHand:** bridge/sim use default **`TrustedHandConfig`**; **`tello_view.init_perception`** (and scripts that call it) uses **`trusted_hand_config_tello_camera()`** for compressed Tello video. **Physical** scripts reuse **`tello_view.init_perception`** where noted.
+Two machines, one pipeline. Video input is either a **PC webcam** or the **Tello camera**. **Bridge, sim, and `tello_view`** share **`hand_detection.detect_hand`** (same YOLO weights table). **TrustedHand:** bridge/sim use default **`TrustedHandConfig`**; **`tello_view.init_perception`** (and scripts that call it) uses **`trusted_hand_config_tello_camera()`** for compressed Tello video. **`tello_real_autonomy_v1.py`** calls **`init_perception`** then sets **`perception["tgate"] = None`** — **TrustedHand off** in preview and flight; **`AUTONOMY_GESTURE_LOCK_FRAMES = 19`**, **`AUTONOMY_GESTURE_UNLOCK_FRAMES = 25`**. Other **`init_perception`** callers (**e.g. `tello_real_flight_test`**) keep the gate when enabled.
 
 ```
 WINDOWS (GPU inference)                    WSL2 (Ubuntu 22.04, ROS2 + Gazebo)
@@ -30,7 +30,7 @@ WINDOWS (GPU inference)                    WSL2 (Ubuntu 22.04, ROS2 + Gazebo)
 
 **Physical Tello (djitellopy, no ROS in repo for flight control):**
 
-- **`tello_real_autonomy_v1.py`** — pre-flight OpenCV preview → takeoff → settle (zero RC) → **SEARCH** (default **`rotate_clockwise` / `rotate_counter_clockwise`** steps; **`--search-mode rc`** for stick yaw) → **FACE_LOCK** (`send_rc_control` yaw only) → **land** (confirmed **open_palm** / **Q** / Ctrl+C). Reuses **`tello_view.init_perception`**.
+- **`tello_real_autonomy_v1.py`** — pre-flight OpenCV preview → takeoff → settle (zero RC) → **SEARCH** (default **`rotate_clockwise` / `rotate_counter_clockwise`** steps; **`--search-mode rc`** for stick yaw) → **FACE_LOCK** (`send_rc_control` yaw only) → **land** (confirmed **open_palm** / **Q** / Ctrl+C). Reuses **`tello_view.init_perception`**, then **clears `tgate`**; **`GestureFilter`** uses **`AUTONOMY_GESTURE_LOCK_FRAMES` / `AUTONOMY_GESTURE_UNLOCK_FRAMES`** (19 / 25).
 
 - **`tello_hover_baseline.py`** — takeoff → **10 s hover, no `rc` commands** → land (stability baseline).
 
@@ -122,11 +122,11 @@ Per-frame diagnostics: `yolo_n`, `yolo_top_conf`, `yolo_pick_conf`, `face_iou`, 
 
 ## Training YOLO hands (offline)
 
-1. `prepare_yolo_hands.py` — HaGRID-250k → `gesture_drone/hagrid_detection/yolo_hands/` (`dataset.yaml`, images, labels).
+1. `prepare_yolo_hands.py` — HaGRID-250k (or your download) → **`gesture_drone/hagrid_detection/yolo_hands/`** (`dataset.yaml`, images, labels). This tree is **gitignored** and may be **absent** after disk cleanup; recreate it before training.
 2. `train_yolo_hands.py` — `YOLO("yolov8n.pt").train(...)` → writes `gesture_drone/models/yolo_hands/` (`weights/best.pt`).
 3. `compare_detectors.py` — side-by-side Bingsu vs HaGRID weights (requires `best.pt` present).
 
-Inference scripts **auto-pick** `best.pt` when the file exists.
+Inference scripts **auto-pick** `best.pt` when the file exists. **Gesture CNN** retraining similarly expects local **`dataset/`** / **`dataset_cropped/`** (gitignored) from the collect/crop pipeline — not required for inference if **`gesture_model.pt`** in **`models/`** is enough.
 
 ## 2D Simulator Physics (`simulate_drone.py`)
 
@@ -176,7 +176,7 @@ Inference scripts **auto-pick** `best.pt` when the file exists.
 | `launch_all.ps1` | Windows | WSL window + wait on :9090 + `gesture_bridge.py`. **`-CameraIndex`** (default 2), **`-Source {webcam,tello}`**. |
 | `simulate_drone.py` | Windows | 2D sim + `hand_detection` + SessionLogger + scale HUD + `--source` / `--world-width-m`; optional **SEARCH / FACE_LOCK** on heading. |
 | `tello_view.py` | Windows | Tello stream (max video settings before **`streamon`**) + **`hand_detection`** + Tello-tuned TrustedHand + gestures; **`--enhance-stream`** optional; **display only**. |
-| `tello_real_autonomy_v1.py` | Windows | **Physical** djitellopy: preview → takeoff → SEARCH / FACE_LOCK → land; no ROS. |
+| `tello_real_autonomy_v1.py` | Windows | **Physical** djitellopy: preview → takeoff → SEARCH / FACE_LOCK → land; no ROS; **TrustedHand off**; autonomy **GestureFilter** 19 / 25. |
 | `tello_hover_baseline.py` | Windows | **Physical** djitellopy: takeoff → 10 s hover (**no rc**) → land. |
 | `tello_real_flight_test.py` | Windows | **Physical** djitellopy: minimal takeoff/hover/land; optional `--onboard` HUD. |
 | `search_behavior.py` | Windows / WSL | Shared **M_ACQUIRE**, **M_LOSS**, **face_ok_and_x_norm**, **`OMEGA_SEARCH`**, lock gains — sim, ROS node, bridge TCP extras, physical autonomy. |
@@ -189,7 +189,7 @@ Inference scripts **auto-pick** `best.pt` when the file exists.
 
 ### Models & data
 
-**In repo:** `gesture_drone/models/gesture_model.pt`, `gesture_drone/models/yolo_hands/weights/best.pt`, `gesture_drone/models/face_detection_yunet_2023mar.onnx`, `gesture_drone/models/hand_landmarker.task` (tracked in git). **Local-only (typical):** optional `hand_yolov8n.pt` fallback, YOLO `last.pt`, backups — still gitignored. **Datasets** under `gesture_drone/` (large trees) remain gitignored; see STATUS for paths.
+**In repo:** `gesture_drone/models/gesture_model.pt`, `gesture_drone/models/yolo_hands/weights/best.pt`, `gesture_drone/models/face_detection_yunet_2023mar.onnx`, `gesture_drone/models/hand_landmarker.task` (tracked in git). **Local-only (typical):** optional `hand_yolov8n.pt` fallback, YOLO `last.pt`, backups — still gitignored. **Training corpora** (`dataset/`, `dataset_cropped/`, `external/`, `hagrid_detection/`) are gitignored and may be **missing** on a slim checkout; see STATUS **Dataset / training corpora** for what was removed here and how to retrain.
 
 ### ROS2 Workspace: `/root/ros2_ws/`
 
@@ -285,7 +285,7 @@ python gesture_drone/scripts/train_model.py
 
 **Scope:** Physical flight uses **djitellopy** in-repo only; there is **no** ROS **`cmd_vel`** path for the real drone in this repo.
 
-- **`tello_real_autonomy_v1.py`:** After connect/stream, **pre-takeoff OpenCV preview** (full HUD). **[T]** arms “ready to fly”; **Enter** in the **console** starts **takeoff**; **[Q]** in the preview window aborts **before** takeoff (**Ctrl+C** aborts preview the same way). Post-takeoff: short settle (**zero RC**), then **SEARCH** (default **discrete `rotate_clockwise` / `rotate_counter_clockwise`** steps to limit stick-coupling drift; **`--search-mode rc`** restores continuous yaw via **`send_rc_control`**), then **FACE_LOCK** (**yaw RC only**). **Land:** GestureFilter-confirmed **open_palm**, or **[Q]** in flight; **Ctrl+C** in flight triggers land, then **`finally`** (zero yaw RC, **`land()`**, **`streamoff`**, **`end()`**, destroy windows).
+- **`tello_real_autonomy_v1.py`:** After connect/stream, **pre-takeoff OpenCV preview** (full HUD). **[T]** arms “ready to fly”; **Enter** in the **console** starts **takeoff**; **[Q]** in the preview window aborts **before** takeoff (**Ctrl+C** aborts preview the same way). Post-takeoff: short settle (**zero RC**), then **SEARCH** (default **discrete `rotate_clockwise` / `rotate_counter_clockwise`** steps to limit stick-coupling drift; **`--search-mode rc`** restores continuous yaw via **`send_rc_control`**), then **FACE_LOCK** (**yaw RC only**). **Land:** GestureFilter-confirmed **open_palm**, or **[Q]** in flight; **Ctrl+C** in flight triggers land, then **`finally`** (zero yaw RC, **`land()`**, **`streamoff`**, **`end()`**, destroy windows). **Perception:** **`perception["tgate"] = None`** after **`init_perception`** — **TrustedHandGate disabled**; **`behavior_allow`** follows YOLO crop only; **`GestureFilter`** lock/unlock **19** / **25** (script constants, not **`simulate_drone`** defaults).
 - **`tello_hover_baseline.py`:** **Takeoff → ~10 s hover with no RC → land.** Use as a **stability / battery / link** sanity check before autonomy.
 - **`tello_real_flight_test.py`:** Minimal scripted flight; optional **`--onboard`** HUD — not the main gesture→motor product path.
 

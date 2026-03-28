@@ -1,6 +1,6 @@
 # Project Status
 
-Last updated: 2026-03-26 (`tello_view.py` stream quality + Tello TrustedHand preset)
+Last updated: 2026-03-27 (tello_view stream enhance + `tello_real_autonomy_v1` policy; `.ai-context` synced)
 
 ## Self-contained clone
 
@@ -13,8 +13,8 @@ A **fresh clone** plus **Windows venv** + `pip install -r requirements.txt` give
 - **cmd_vel (conservative)**: Default forward/up use **`VELOCITY_FORWARD = 0.12`**, **`VELOCITY_UP = 0.10`** m/s. When **`beh_state`** is **`SEARCH`** or **`FACE_LOCK`** (fist-edge + face TCP fields), the node publishes **`angular.z`** autonomy yaw and **zero linear** translation (see **`gesture_ros2_node.py`**).
 - **TCP watchdog**: No line from Windows for **>3 s** → treat as **STOP** (zero twist when flying).
 - **2D simulator** (`simulate_drone.py`): Same perception as bridge; **HVEL/VVEL** HUD; **`--source tello`**; SessionLogger; optional **MANUAL / SEARCH / FACE_LOCK** + **`H_HOLD` “settled”** line on HUD; fist toggles autonomy in sim.
-- **Tello preview** (`tello_view.py`): **`hand_detection.detect_hand`** + TrustedHand + YuNet + GestureFilter + HUD; **no flight commands**. After **`connect()`**, requests **720p / 30 fps / 5 Mbps** via djitellopy (try/except). **TrustedHand** uses **`trusted_hand_config_tello_camera()`** — lower MP detection/presence thresholds, **288px** min crop upscale, **`min_landmarks=14`**, temporal **K_CREATE=3** / **MP_MISS_DROP=7** (CLI overrides). Optional **`--enhance-stream`**: bilateral denoise + unsharp before perception.
-- **Physical Tello (djitellopy)**: **`tello_real_autonomy_v1.py`** (preview **[T]** → Enter → takeoff → SEARCH default **cw/ccw** steps → FACE_LOCK **rc** yaw → **open_palm** / **Q** / Ctrl+C land); **`tello_hover_baseline.py`** (10 s hover **no rc**); **`tello_real_flight_test.py`** (minimal flight + optional `--onboard`**).
+- **Tello preview** (`tello_view.py`): **`hand_detection.detect_hand`** + TrustedHand + YuNet + GestureFilter + HUD; **no flight commands**. After **`connect()`**, requests **720p / 30 fps / 5 Mbps** via djitellopy (try/except). **TrustedHand** uses **`trusted_hand_config_tello_camera()`** — lower MP detection/presence thresholds, **288px** min crop upscale, **`min_landmarks=14`**, temporal **K_CREATE=3** / **MP_MISS_DROP=7** (CLI overrides). Optional **`-E` / `--enhance-stream`**: **bilateral** (**d=7**, σColor/Space **50**) → **unsharp** (same defaults as before: amount **1.35**, Gaussian blur σ **1.0**, blend **0.35**) on each frame; cyan **ENHANCED** badge. No exposure lift, no CLAHE, no **`--enhance-cuda`**. Preview FPS is usually bound by **Wi‑Fi / H.264 decode**, not this step.
+- **Physical Tello (djitellopy)**: **`tello_real_autonomy_v1.py`** (preview **[T]** → Enter → takeoff → SEARCH default **cw/ccw** steps → FACE_LOCK **rc** yaw → **open_palm** / **Q** / Ctrl+C land); **`tello_hover_baseline.py`** (10 s hover **no rc**); **`tello_real_flight_test.py`** (minimal flight + optional **`--onboard`**). **Autonomy v1 only:** after **`init_perception`**, **`perception["tgate"] = None`** — **TrustedHandGate is off** in preview and flight; **`behavior_allow`** follows YOLO crop only. **GestureFilter** uses script-local **`AUTONOMY_GESTURE_LOCK_FRAMES = 19`** / **`AUTONOMY_GESTURE_UNLOCK_FRAMES = 25`** (bridge/sim/`tello_view` remain **8** / **12**). TrustedHand unchanged everywhere else.
 - **Launchers**: `launch_all.ps1` with **`-Source webcam|tello`**; repo **`Load-PowerShellAliases.ps1`** — **`drone`**, **`tello-autonomy`**, **`tello-realtest`**, etc.; add **`tello-hover`** locally if desired (see ARCHITECTURE).
 - **YOLO hands** (HaGRID `models/yolo_hands/weights/best.pt` if present, else HF **`hand_yolov8n.pt`**), **`hand_detection.detect_hand`** + **`TrustedHandGate`** (**MediaPipe** verifies YOLO crop; **on by default**; `--no-perception-gate` or `MLX_GESTURE_PERCEPTION_GATE=0` off) + **BboxSmoother** + **GestureFilter** on **`gesture_bridge.py`** and **`simulate_drone.py`**. Pre-trust: classifier may run for debug/session log **only**; `behavior_allow` gates `GestureFilter`. **Field-tested:** YOLO FPs rarely break behavior; MP structural check is conservative on non-hands; reduces need for room-specific YOLO hard negatives.
 - **`tello_view.py`:** Uses **`hand_detection.detect_hand`** + **TrustedHandGate** (Tello-tuned config) + YuNet; bridge/sim still use generic **`TrustedHandConfig`** unless changed later.
@@ -30,6 +30,7 @@ Shared constants (tune in `simulate_drone.py` / `gesture_bridge.py`):
 | `window` | 10 | Sliding history |
 | `GESTURE_LOCK_FRAMES` | **8** | Frames to lock a gesture |
 | `GESTURE_UNLOCK_FRAMES` | **12** | Frames to switch away (hysteresis) |
+| *`tello_real_autonomy_v1.py`* | **19** / **25** | Same filter class: **`AUTONOMY_GESTURE_LOCK_FRAMES`** / **`AUTONOMY_GESTURE_UNLOCK_FRAMES`** (TrustedHand off; stricter temporal gating for physical flight) |
 | `min_vote_share` | 0.60 | Dead-band |
 | `CONFIDENCE_THRESHOLD` | 0.85 | Below → no vote |
 | `COMMAND_COOLDOWN` | **1.2 s** | Min time between accepted command changes |
@@ -64,9 +65,13 @@ See ARCHITECTURE **Troubleshooting (minimal)** for a symptom → cause table (BU
 
 (See previous STATUS: WSLg `wsl --shutdown`, 5-class unknown model reverted, MediaPipe **detection** replaced by YOLO, `torch.compile` disabled on WSL, threshold-only fixes for wrong class.)
 
-## Dataset Stats
+## Dataset / training corpora (local disk)
 
-Unchanged: **114,060 / 28,707** train/val in `dataset_cropped/` (4 classes + HaGRID merge). See STATUS history or JOURNEY for breakdown.
+**2026-03-27:** The large gitignored trees **`gesture_drone/hagrid_detection/`**, **`gesture_drone/external/`**, **`gesture_drone/dataset_cropped/`**, and **`gesture_drone/dataset/`** were **removed** from this workspace to reclaim disk. **Inference is unchanged** — weights live under **`gesture_drone/models/`** (tracked in git).
+
+**Historical training split** (for reference only, no longer on disk here): **114,060 / 28,707** train/val cropped images (4 classes + HaGRID merge). Full breakdown and narrative: **`JOURNEY.md`**.
+
+**Retraining YOLO or gesture classifiers** requires re-downloading HaGRID (or your corpus), re-running **`prepare_yolo_hands.py`** / **`train_yolo_hands.py`** and the gesture **`collect_data.py` → `train_model.py`** style pipeline so those directories are repopulated.
 
 ## Key File Locations
 
@@ -108,6 +113,18 @@ Unchanged: **114,060 / 28,707** train/val in `dataset_cropped/` (4 classes + HaG
 
 ## Recent Changes (chronological summary)
 
+### 2026-03-27 — `tello_view.py` stream enhance simplified; `tello_real_autonomy_v1.py` perception policy
+- **`--enhance-stream` (`-E`):** Pipeline reverted to **bilateral + unsharp** only (defaults unchanged). Removed **conditional exposure**, **CLAHE (LAB L)**, **`--enhance-cuda`**, and related **`--enhance-*`** CLI flags.
+- **`tello_real_autonomy_v1.py`:** **`perception["tgate"] = None`** immediately after **`init_perception`** so **TrustedHandGate never runs** in preview or flight; **`AUTONOMY_GESTURE_LOCK_FRAMES = 19`**, **`AUTONOMY_GESTURE_UNLOCK_FRAMES = 25`**. Q / Ctrl+C remain quick abort/land paths; open palm still uses standard GestureFilter hysteresis (including **25**-frame switch-away when already locked on another gesture).
+
+### 2026-03-27 — Local training corpora removed
+- **Deleted from disk (gitignored paths):** `gesture_drone/hagrid_detection/`, `gesture_drone/external/`, `gesture_drone/dataset_cropped/`, `gesture_drone/dataset/` (~190+ GB). **`venv/`** preserved.
+- **Runtime:** Still **`gesture_drone/models/`** only for default stack; no behavior change for bridge / sim / Tello scripts.
+- **Docs:** **STATUS** (this section + **Dataset / training corpora**); **ARCHITECTURE** (**Training YOLO hands**, **Models & data**); **`.ai-context/README.md`** (repo hygiene).
+
+### 2026-03-26 — `tello_view.py`: experimental `-E` pipeline (superseded)
+- **Note:** For a short period, **`--enhance-stream`** also ran **exposure compensation**, **CLAHE on LAB L**, and optional **`--enhance-cuda`**. That path was **removed 2026-03-27**; current behavior is **bilateral + unsharp** only (see entry above).
+
 ### 2026-03-26 — Tello preview: PowerShell arg forwarding + debug handoff
 - **`tello`** function in **`Load-PowerShellAliases.ps1`** uses **`ValueFromRemainingArguments`** so `tello --enhance-stream` / **`tello -E`** reliably reaches Python (plain `@args` could drop flags in some profiles).
 - **`tello_view.py`:** always prints **`[flags] enhance_stream=...`** after banner; **`-E`** alias for **`--enhance-stream`**.
@@ -115,8 +132,8 @@ Unchanged: **114,060 / 28,707** train/val in `dataset_cropped/` (4 classes + HaG
 
 ### 2026-03-26 — `tello_view.py`: Tello stream + TrustedHand tuning (preview only)
 - **Video:** `set_video_resolution(720P)`, `set_video_fps(30)`, `set_video_bitrate(5Mbps)` after connect, before **`streamon()`** (errors logged, non-fatal). Implemented in **`tello_view.main()`** only (bridge/sim unchanged).
-- **Perception:** **`trusted_hand_config_tello_camera()`** in **`perception_gating.py`** — softer HandLandmarker confidences, higher **`mp_infer_min_side`**, slightly lower **`mp_min_landmarks`**, relaxed temporal defaults; **`tello_view.init_perception`** uses **`dataclasses.replace`** with **`--k-create` / `--mp-miss-drop` / `--no-box-drop`** overrides. Any script that calls **`init_perception`** (e.g. **`tello_real_autonomy_v1`**, **`tello_real_flight_test`**) gets the same Tello MediaPipe preset.
-- **Optional:** **`--enhance-stream`** — cheap bilateral + unsharp on each frame (no deep SR); **`tello_view`** only.
+- **Perception:** **`trusted_hand_config_tello_camera()`** in **`perception_gating.py`** — softer HandLandmarker confidences, higher **`mp_infer_min_side`**, slightly lower **`mp_min_landmarks`**, relaxed temporal defaults; **`tello_view.init_perception`** uses **`dataclasses.replace`** with **`--k-create` / `--mp-miss-drop` / `--no-box-drop`** overrides. Scripts that call **`init_perception`** (**`tello_real_flight_test`**, **`tello_real_autonomy_v1`**) load the same preset; **autonomy v1** then clears **`tgate`** so TrustedHand does not run there.
+- **Optional:** **`--enhance-stream`** — bilateral + unsharp on **`tello_view`** only (see **2026-03-27** entry).
 - **Docs:** **STATUS** (this file); **ARCHITECTURE**; root **README** Tello preview blurb.
 
 ### 2026-03-26 — MediaPipe `hand_landmarker.task` tracked in git

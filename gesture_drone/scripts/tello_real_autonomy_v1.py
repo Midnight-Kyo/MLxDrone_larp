@@ -2,8 +2,9 @@ r"""
 Physical Tello — v1 autonomy (no ROS): SEARCH (slow yaw) → FACE_LOCK (face centering) → land on open palm.
 
 - Reuses ``tello_view.init_perception`` (YOLO + YuNet + GestureFilter + classifier).
-- **TrustedHandGate is off** for this script only (``perception["tgate"] = None`` after init); stricter
-  ``AUTONOMY_*`` GestureFilter lock/unlock applies. MP gate remains on in ``tello_view`` and bridge/sim.
+- **TrustedHandGate is off** (``perception["tgate"] = None`` after init); **GestureFilter** uses
+  ``AUTONOMY_GESTURE_*`` from ``simulate_drone`` (19 / 25). Default ``tello_view`` / bridge / sim keep
+  TrustedHand + 8 / 12; **``tello_view --autonomy-preview``** matches this stack on the ground (no motors).
 - Reuses ``search_behavior`` face gating and streak constants.
 - SEARCH default: SDK **cw/ccw** steps (in-place rotation; avoids lateral drift from ``rc`` yaw).
 - Optional **--search-mode rc** for continuous stick yaw. FACE_LOCK still uses ``rc`` yaw only on the 4th axis.
@@ -42,6 +43,8 @@ from search_behavior import (
     face_ok_and_x_norm,
 )
 from simulate_drone import (
+    AUTONOMY_GESTURE_LOCK_FRAMES,
+    AUTONOMY_GESTURE_UNLOCK_FRAMES,
     BboxSmoother,
     COMMAND_COOLDOWN,
     CONFIDENCE_THRESHOLD,
@@ -55,10 +58,6 @@ from simulate_drone import (
 from yunet_face import detect_largest_face
 
 FACE_HAND_IOU_MAX = 0.22
-
-# Tello camera only — slower GestureFilter commitment for physical flight (this script only).
-AUTONOMY_GESTURE_LOCK_FRAMES = 19
-AUTONOMY_GESTURE_UNLOCK_FRAMES = 25
 
 # Conservative RC yaw magnitude (-100..100). Tune via CLI.
 DEFAULT_SEARCH_YAW_RC = 22

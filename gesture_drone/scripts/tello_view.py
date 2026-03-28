@@ -4,7 +4,9 @@ Live gesture recognition using the **Tello camera** — **same perception stack 
 + **YuNet** + **GestureFilter** + follow latch. **Trusted-hand is ON by default** with
 **Tello-tuned** MediaPipe thresholds / crop upscale (``trusted_hand_config_tello_camera`` —
 softer on compressed drone video than bridge/webcam). Use ``--no-perception-gate`` or
-``MLX_GESTURE_PERCEPTION_GATE=0`` only to disable.
+``MLX_GESTURE_PERCEPTION_GATE=0`` only to disable. Use ``--autonomy-preview`` to match
+``tello_real_autonomy_v1.py`` on the ground: **TrustedHand off** + **19/25** GestureFilter
+(no motors).
 
 After **connect**, requests **720p / 30 fps / 5 Mbps** before **streamon** (each command is tried
 separately; some firmware rejects ``setresolution``). Optional ``--enhance-stream``: bilateral +
@@ -48,6 +50,8 @@ from perception_gating import (
     trusted_hand_config_tello_camera,
 )
 from simulate_drone import (
+    AUTONOMY_GESTURE_LOCK_FRAMES,
+    AUTONOMY_GESTURE_UNLOCK_FRAMES,
     BboxSmoother,
     COMMAND_COOLDOWN,
     CONFIDENCE_THRESHOLD,
@@ -149,6 +153,14 @@ def add_preview_arguments(p: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Preprocess frames: bilateral + unsharp (cheap sharpen for compressed video).",
     )
+    p.add_argument(
+        "--autonomy-preview",
+        action="store_true",
+        help=(
+            "Match tello_real_autonomy_v1 on the ground: implies --no-perception-gate (no MediaPipe "
+            "load) and GestureFilter 19/25. Default preview: TrustedHand on + 8/12."
+        ),
+    )
 
 
 def parse_args():
@@ -231,11 +243,22 @@ def run_preview_loop(
     face_detector = perception["face_detector"]
     yunet_load_error = perception["yunet_load_error"]
 
+    lock_f = (
+        AUTONOMY_GESTURE_LOCK_FRAMES
+        if getattr(args, "autonomy_preview", False)
+        else GESTURE_LOCK_FRAMES
+    )
+    unlock_f = (
+        AUTONOMY_GESTURE_UNLOCK_FRAMES
+        if getattr(args, "autonomy_preview", False)
+        else GESTURE_UNLOCK_FRAMES
+    )
+
     smoother = BboxSmoother(alpha=0.4, max_miss_frames=8)
     gfilter = GestureFilter(
         window=10,
-        lock_frames=GESTURE_LOCK_FRAMES,
-        unlock_frames=GESTURE_UNLOCK_FRAMES,
+        lock_frames=lock_f,
+        unlock_frames=unlock_f,
         min_vote_share=0.60,
     )
     proximity_smoother = ProximitySmoother(alpha=0.35)
@@ -259,7 +282,7 @@ def run_preview_loop(
             "  Perception input: enhancement ON — bilateral + unsharp; cyan ENHANCED badge top-left."
         )
     print(
-        f"GestureFilter: lock={GESTURE_LOCK_FRAMES} unlock={GESTURE_UNLOCK_FRAMES}; "
+        f"GestureFilter: lock={lock_f} unlock={unlock_f}; "
         f"conf {CONFIDENCE_THRESHOLD:.0%}; Trusted-hand: "
         f"{'ON' if tgate is not None else 'OFF'}"
     )
@@ -469,6 +492,8 @@ def run_preview_loop(
 
 def main():
     args = parse_args()
+    if args.autonomy_preview:
+        args.no_perception_gate = True
 
     print("=" * 50)
     print("  TELLO GESTURE VIEWER  (same perception stack as simulate_drone)")
@@ -476,12 +501,18 @@ def main():
     print()
     print(
         f"  [flags] enhance_stream={args.enhance_stream}  "
-        f"(if False but you passed --enhance-stream, the shell dropped args; see "
+        f"autonomy_preview={args.autonomy_preview}  "
+        f"(if a flag is False but you passed it, the shell may have dropped args; see "
         f"gesture_drone/docs/TELLO_VIEW_DEBUG_HANDOFF.md)"
     )
     print()
 
     perception = init_perception(args)
+    if args.autonomy_preview:
+        print(
+            "  --autonomy-preview: same perception policy as tello_real_autonomy_v1 — "
+            "TrustedHand skipped, GestureFilter 19/25 in the HUD loop."
+        )
 
     print()
     if args.enhance_stream:

@@ -87,6 +87,10 @@ COMMAND_COOLDOWN    = 1.2    # seconds between accepted command changes
 GESTURE_LOCK_FRAMES = 8      # more frames before a gesture locks (was 6)
 GESTURE_UNLOCK_FRAMES = 12  # harder to switch away from a locked gesture (was 10)
 
+# Physical `tello_real_autonomy_v1.py` and optional `tello_view.py --autonomy-preview`
+AUTONOMY_GESTURE_LOCK_FRAMES = 19
+AUTONOMY_GESTURE_UNLOCK_FRAMES = 25
+
 # 2D sim speeds (horizontal uses pixels; see SIM_WORLD_WIDTH_M for m/s readout)
 SIM_MOVE_SPEED_PX_S = 28.0   # px/s across the top-down panel
 SIM_ALT_SPEED_M_S   = 0.45   # m/s for simulated altitude (vertical axis)

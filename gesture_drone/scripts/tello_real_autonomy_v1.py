@@ -1,7 +1,9 @@
 r"""
 Physical Tello — v1 autonomy (no ROS): SEARCH (slow yaw) → FACE_LOCK (face centering) → land on open palm.
 
-- Reuses ``tello_view.init_perception`` (YOLO + TrustedHand + YuNet + GestureFilter + classifier).
+- Reuses ``tello_view.init_perception`` (YOLO + YuNet + GestureFilter + classifier).
+- **TrustedHandGate is off** for this script only (``perception["tgate"] = None`` after init); stricter
+  ``AUTONOMY_*`` GestureFilter lock/unlock applies. MP gate remains on in ``tello_view`` and bridge/sim.
 - Reuses ``search_behavior`` face gating and streak constants.
 - SEARCH default: SDK **cw/ccw** steps (in-place rotation; avoids lateral drift from ``rc`` yaw).
 - Optional **--search-mode rc** for continuous stick yaw. FACE_LOCK still uses ``rc`` yaw only on the 4th axis.
@@ -10,7 +12,8 @@ Windows: join TELLO-XXXX Wi‑Fi, clear space, then (with project venv):
 
     python gesture_drone/scripts/tello_real_autonomy_v1.py
 
-Options: same TrustedHand flags as ``tello_view`` (see ``--help``). Ctrl+C or ``Q`` attempts zero-RC then ``land()``.
+Preview CLI flags match ``tello_view.add_preview_arguments`` (see ``--help``); TrustedHand args are ignored
+because the gate is forced off after init. Ctrl+C or ``Q`` attempts zero-RC then ``land()``.
 
 Open palm (GestureFilter **confirmed**) triggers land while in SEARCH or FACE_LOCK only.
 
@@ -30,7 +33,6 @@ import cv2
 import tello_view
 from djitellopy import Tello
 from hand_detection import detect_hand
-from perception_gating import format_trust_hud_line
 from search_behavior import (
     EPS_X,
     M_ACQUIRE,
@@ -43,8 +45,6 @@ from simulate_drone import (
     BboxSmoother,
     COMMAND_COOLDOWN,
     CONFIDENCE_THRESHOLD,
-    GESTURE_LOCK_FRAMES,
-    GESTURE_UNLOCK_FRAMES,
     YUNET_FRAME_STRIDE,
     YUNET_MAX_INFER_SIDE,
     PADDING_RATIO,
@@ -55,6 +55,10 @@ from simulate_drone import (
 from yunet_face import detect_largest_face
 
 FACE_HAND_IOU_MAX = 0.22
+
+# Tello camera only — slower GestureFilter commitment for physical flight (this script only).
+AUTONOMY_GESTURE_LOCK_FRAMES = 19
+AUTONOMY_GESTURE_UNLOCK_FRAMES = 25
 
 # Conservative RC yaw magnitude (-100..100). Tune via CLI.
 DEFAULT_SEARCH_YAW_RC = 22
@@ -157,15 +161,14 @@ def run_pre_takeoff_preview(
     model = perception["model"]
     class_names = perception["class_names"]
     detector = perception["detector"]
-    tgate = perception["tgate"]
     face_detector = perception["face_detector"]
     yunet_load_error = perception["yunet_load_error"]
 
     smoother = BboxSmoother(alpha=0.4, max_miss_frames=8)
     gfilter = GestureFilter(
         window=10,
-        lock_frames=GESTURE_LOCK_FRAMES,
-        unlock_frames=GESTURE_UNLOCK_FRAMES,
+        lock_frames=AUTONOMY_GESTURE_LOCK_FRAMES,
+        unlock_frames=AUTONOMY_GESTURE_UNLOCK_FRAMES,
         min_vote_share=0.60,
     )
     telem_timer = time.time()
@@ -231,13 +234,10 @@ def run_pre_takeoff_preview(
                 face_hand_iou_max=FACE_HAND_IOU_MAX,
                 padding_ratio=PADDING_RATIO,
             )
-            if tgate is not None:
-                frame_diag = tgate.update(hand_crop, frame_diag)
-            else:
-                frame_diag = dict(frame_diag or {})
-                frame_diag["trust_enabled"] = False
-                frame_diag["behavior_allow"] = hand_crop is not None
-                frame_diag["trust_phase"] = "gate_off"
+            frame_diag = dict(frame_diag or {})
+            frame_diag["trust_enabled"] = False
+            frame_diag["behavior_allow"] = hand_crop is not None
+            frame_diag["trust_phase"] = "gate_off"
 
             behavior_allow = bool(frame_diag.get("behavior_allow", hand_crop is not None))
 
@@ -266,11 +266,11 @@ def run_pre_takeoff_preview(
 
             face_ok, face_x_norm = face_ok_and_x_norm(face_fb, face_score, fw, fh)
 
-            trust_hud = format_trust_hud_line(frame_diag) if tgate is not None else None
+            trust_hud = None
             beh_line = (
                 "PREVIEW | [T] ready → Enter in console to take off | "
                 f"f_ok={int(face_ok)} x={face_x_norm:+.2f} | "
-                f"conf {CONFIDENCE_THRESHOLD:.0%} gate | bat={battery}%"
+                f"classifier≥{CONFIDENCE_THRESHOLD:.0%} | bat={battery}%"
             )
             draw_cam_panel(
                 frame_bgr,
@@ -324,6 +324,7 @@ def main() -> int:
     except Exception as e:
         print(f"ERROR: perception init failed: {e}", file=sys.stderr)
         return 1
+    perception["tgate"] = None
     if perception["face_detector"] is None:
         print(
             "ERROR: YuNet face detector required for SEARCH / FACE_LOCK. Fix ONNX under models/.",
@@ -365,15 +366,14 @@ def main() -> int:
     model = perception["model"]
     class_names = perception["class_names"]
     detector = perception["detector"]
-    tgate = perception["tgate"]
     face_detector = perception["face_detector"]
     yunet_load_error = perception["yunet_load_error"]
 
     smoother = BboxSmoother(alpha=0.4, max_miss_frames=8)
     gfilter = GestureFilter(
         window=10,
-        lock_frames=GESTURE_LOCK_FRAMES,
-        unlock_frames=GESTURE_UNLOCK_FRAMES,
+        lock_frames=AUTONOMY_GESTURE_LOCK_FRAMES,
+        unlock_frames=AUTONOMY_GESTURE_UNLOCK_FRAMES,
         min_vote_share=0.60,
     )
 
@@ -477,13 +477,10 @@ def main() -> int:
                 face_hand_iou_max=FACE_HAND_IOU_MAX,
                 padding_ratio=PADDING_RATIO,
             )
-            if tgate is not None:
-                frame_diag = tgate.update(hand_crop, frame_diag)
-            else:
-                frame_diag = dict(frame_diag or {})
-                frame_diag["trust_enabled"] = False
-                frame_diag["behavior_allow"] = hand_crop is not None
-                frame_diag["trust_phase"] = "gate_off"
+            frame_diag = dict(frame_diag or {})
+            frame_diag["trust_enabled"] = False
+            frame_diag["behavior_allow"] = hand_crop is not None
+            frame_diag["trust_phase"] = "gate_off"
 
             behavior_allow = bool(frame_diag.get("behavior_allow", hand_crop is not None))
 
@@ -597,7 +594,7 @@ def main() -> int:
 
             last_yaw_rc = yaw_rc
 
-            trust_hud = format_trust_hud_line(frame_diag) if tgate is not None else None
+            trust_hud = None
             if state == "SEARCH" and args.search_mode == "cw":
                 search_note = f"SEARCH=cw {args.search_cw_degrees}deg/{args.search_cw_interval:.2f}s"
             elif state == "SEARCH":

@@ -8,7 +8,7 @@ softer on compressed drone video than bridge/webcam). Use ``--no-perception-gate
 
 After **connect**, requests **720p / 30 fps / 5 Mbps** before **streamon** (each command is tried
 separately; some firmware rejects ``setresolution``). Optional ``--enhance-stream``: bilateral +
-unsharp on each frame; cyan **ENHANCED** badge top-left on the video.
+unsharp on each frame; cyan **ENHANCED** badge.
 
 **No flight commands** in this script (no ROS / TCP).
 
@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import argparse
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -79,14 +79,48 @@ MODEL_DIR = SCRIPT_DIR.parent / "models"
 
 FACE_HAND_IOU_MAX = 0.22
 
+#
+# NOTE: Tello preview FPS is usually limited by Wi‑Fi, H.264 decode, and djitellopy — not by
+# bilateral/unsharp on a modern CPU.
+#
 
-def enhance_tello_frame_bgr(frame_bgr: np.ndarray) -> np.ndarray:
-    """Mild bilateral denoise + unsharp for compressed Tello video (cheap, real-time)."""
+
+@dataclass(frozen=True)
+class TelloEnhanceParams:
+    """Bilateral + unsharp for compressed Tello video (see ``enhance_tello_frame_bgr``)."""
+
+    bilateral_d: int = 7
+    bilateral_sigma_color: int = 50
+    bilateral_sigma_space: int = 50
+    unsharp_amount: float = 1.35
+    unsharp_blur_sigma: float = 1.0
+    unsharp_blend_sub: float = 0.35
+
+
+def _bilateral_unsharp(bgr: np.ndarray, p: TelloEnhanceParams) -> np.ndarray:
+    b = cv2.bilateralFilter(
+        bgr,
+        d=p.bilateral_d,
+        sigmaColor=p.bilateral_sigma_color,
+        sigmaSpace=p.bilateral_sigma_space,
+    )
+    blur = cv2.GaussianBlur(b, (0, 0), p.unsharp_blur_sigma)
+    return cv2.addWeighted(b, p.unsharp_amount, blur, -p.unsharp_blend_sub, 0)
+
+
+def enhance_tello_frame_bgr(
+    frame_bgr: np.ndarray,
+    p: TelloEnhanceParams,
+) -> np.ndarray:
     if frame_bgr is None or frame_bgr.size == 0:
         return frame_bgr
-    bgr = cv2.bilateralFilter(frame_bgr, d=5, sigmaColor=40, sigmaSpace=40)
-    blur = cv2.GaussianBlur(bgr, (0, 0), 1.0)
-    return cv2.addWeighted(bgr, 1.25, blur, -0.25, 0)
+    bgr = np.ascontiguousarray(frame_bgr)
+    return _bilateral_unsharp(bgr, p)
+
+
+def tello_enhance_params_from_args(_args: Any) -> TelloEnhanceParams:
+    """Reserved for future CLI tuning; currently returns defaults."""
+    return TelloEnhanceParams()
 
 
 def add_preview_arguments(p: argparse.ArgumentParser) -> None:
@@ -113,7 +147,7 @@ def add_preview_arguments(p: argparse.ArgumentParser) -> None:
         "-E",
         "--enhance-stream",
         action="store_true",
-        help="Cheap preprocessing: bilateral denoise + unsharp on each frame before perception.",
+        help="Preprocess frames: bilateral + unsharp (cheap sharpen for compressed video).",
     )
 
 
@@ -217,8 +251,13 @@ def run_preview_loop(
     last_command_time = 0.0
 
     print("HUD running. Q = quit this window.")
+    en_params = (
+        tello_enhance_params_from_args(args) if args.enhance_stream else None
+    )
     if args.enhance_stream:
-        print("  Perception input: stream enhancement ON (cyan ENHANCED badge, top-left).")
+        print(
+            "  Perception input: enhancement ON — bilateral + unsharp; cyan ENHANCED badge top-left."
+        )
     print(
         f"GestureFilter: lock={GESTURE_LOCK_FRAMES} unlock={GESTURE_UNLOCK_FRAMES}; "
         f"conf {CONFIDENCE_THRESHOLD:.0%}; Trusted-hand: "
@@ -232,8 +271,8 @@ def run_preview_loop(
                 time.sleep(0.01)
                 continue
 
-            if args.enhance_stream:
-                frame_bgr = enhance_tello_frame_bgr(frame_bgr)
+            if en_params is not None:
+                frame_bgr = enhance_tello_frame_bgr(frame_bgr, en_params)
 
             if time.time() - telem_timer > 3.0:
                 try:
@@ -447,7 +486,7 @@ def main():
     print()
     if args.enhance_stream:
         print(
-            "  Stream enhancement: ON (bilateral + unsharp; cyan ENHANCED badge top-left)"
+            "  Stream enhancement: ON (bilateral + unsharp — FPS usually limited by Wi‑Fi/H.264)"
         )
         print()
     print("Connecting to Tello drone…")

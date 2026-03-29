@@ -43,6 +43,12 @@ from torchvision.models import efficientnet_b0
 
 import hand_detection
 from hand_detection import detect_hand
+from gesture_filter import (
+    GESTURE_LOCK_SECONDS,
+    GESTURE_UNLOCK_SECONDS,
+    GESTURE_WINDOW_SECONDS,
+    GestureFilter,
+)
 from perception_gating import (
     TrustedHandConfig,
     TrustedHandGate,
@@ -83,13 +89,7 @@ PADDING_RATIO = 0.08   # YOLO boxes already contain the full hand; less padding 
 CONFIDENCE_THRESHOLD = 0.85
 
 # Conservative defaults: slow motion + fewer command edges (tune up after Gazebo/real tests).
-COMMAND_COOLDOWN    = 1.2    # seconds between accepted command changes
-GESTURE_LOCK_FRAMES = 8      # more frames before a gesture locks (was 6)
-GESTURE_UNLOCK_FRAMES = 12  # harder to switch away from a locked gesture (was 10)
-
-# Physical `tello_real_autonomy_v1.py` and optional `tello_view.py --autonomy-preview`
-AUTONOMY_GESTURE_LOCK_FRAMES = 19
-AUTONOMY_GESTURE_UNLOCK_FRAMES = 25
+COMMAND_COOLDOWN = 1.2  # seconds between accepted command changes
 
 # 2D sim speeds (horizontal uses pixels; see SIM_WORLD_WIDTH_M for m/s readout)
 SIM_MOVE_SPEED_PX_S = 28.0   # px/s across the top-down panel
@@ -187,89 +187,6 @@ def find_camera(cam_index=0):
         return cap
     print(f"ERROR: Camera {cam_index} not found.")
     return None
-
-
-class GestureFilter:
-    """
-    Confidence-weighted, recency-biased sliding-window gesture filter with
-    dead-band and asymmetric hysteresis.
-
-    Each frame's vote is weighted by its classifier confidence AND by how
-    recent it is (newest frame = 1.0, oldest = 0.5).  A gesture only
-    becomes "confirmed" once it wins the weighted vote by a clear margin
-    (min_vote_share) AND has led for a sufficient streak of frames.
-    Switching away from an already-confirmed gesture requires a longer
-    streak (unlock_frames) than initial lock-in (lock_frames), giving the
-    system deliberate stickiness.
-    """
-    def __init__(self, window=10, lock_frames=GESTURE_LOCK_FRAMES,
-                 unlock_frames=GESTURE_UNLOCK_FRAMES, min_vote_share=0.60):
-        self._window         = window
-        self._lock_frames    = lock_frames
-        self._unlock_frames  = unlock_frames
-        self._min_vote_share = min_vote_share
-        self._history        = []   # list of (label, confidence)
-        self._streak         = 0
-        self._streak_cand    = None
-        self._confirmed      = None
-        self._lock_target    = lock_frames
-
-    def update(self, gesture, confidence=1.0):
-        """Feed one frame's result (gesture=None means no hand). Returns confirmed gesture."""
-        label = gesture if gesture is not None else "__none__"
-        conf  = float(confidence) if confidence is not None else 0.0
-        self._history.append((label, conf))
-        if len(self._history) > self._window:
-            self._history.pop(0)
-
-        n = len(self._history)
-        # Weighted votes: recency 0.5 (oldest) → 1.0 (newest), scaled by confidence
-        vote_totals  = {}
-        total_weight = 0.0
-        for i, (g, c) in enumerate(self._history):
-            recency = 0.5 + 0.5 * (i / max(1, n - 1))
-            w = c * recency
-            vote_totals[g]  = vote_totals.get(g, 0.0) + w
-            total_weight   += w
-
-        winner       = max(vote_totals, key=vote_totals.get)
-        winner_share = vote_totals[winner] / total_weight if total_weight > 0 else 0.0
-        winner_gest  = winner if winner != "__none__" else None
-
-        # Dead band: if the leading gesture doesn't hold a clear majority, hold still
-        if winner_share < self._min_vote_share:
-            self._streak      = 0
-            self._streak_cand = None
-            return self._confirmed
-
-        # Hysteresis: switching away from a confirmed gesture is harder
-        if self._confirmed is not None and winner_gest != self._confirmed:
-            self._lock_target = self._unlock_frames
-        else:
-            self._lock_target = self._lock_frames
-
-        # Streak counting
-        if winner_gest == self._streak_cand:
-            self._streak += 1
-        else:
-            self._streak_cand = winner_gest
-            self._streak      = 1
-
-        if self._streak >= self._lock_target:
-            self._confirmed = winner_gest
-
-        return self._confirmed
-
-    @property
-    def streak_ratio(self):
-        """0.0–1.0 progress toward confirming the current streak candidate."""
-        if self._lock_target == 0:
-            return 0.0
-        return min(1.0, self._streak / self._lock_target)
-
-    @property
-    def lock_target(self):
-        return self._lock_target
 
 
 class SessionLogger:
@@ -492,10 +409,12 @@ def _norm_heading_deg(deg: float) -> float:
 def draw_cam_panel(frame, raw_gesture, gesture, confidence, bbox, command, fps, gfilter=None,
                    source_label="", battery=None, temp=None,
                    follow_preview=False, face_proximity=None, face_tracked=False,
-                   yunet_error=None, trust_line=None, beh_line=None):
+                   yunet_error=None, trust_line=None, beh_line=None,
+                   hud_streak_ratio=None):
     h, w = frame.shape[:2]
     hud_extra = (28 if trust_line else 0) + (28 if beh_line else 0)
-    hud_h = (138 if follow_preview else 128) + hud_extra
+    core_h = (138 if follow_preview else 128) + hud_extra
+    hud_h = core_h
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, 0), (w, hud_h), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
@@ -548,7 +467,7 @@ def draw_cam_panel(frame, raw_gesture, gesture, confidence, bbox, command, fps, 
         cv2.putText(
             frame,
             trust_line[: min(95, len(trust_line))],
-            (12, hud_h - (48 if beh_line else 26)),
+            (12, core_h - (48 if beh_line else 26)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.42,
             (160, 200, 160),
@@ -558,20 +477,31 @@ def draw_cam_panel(frame, raw_gesture, gesture, confidence, bbox, command, fps, 
         cv2.putText(
             frame,
             beh_line[: min(145, len(beh_line))],
-            (12, hud_h - 26),
+            (12, core_h - 26),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.40,
             (200, 180, 255),
             1,
         )
 
-    # Confirmation progress bar — fills as the gesture streak builds toward lock-in
+    # Confirmation progress bar — fills from time-based GestureFilter.streak_ratio.
+    # Do not gate on ``gesture != "No hand"``: until first lock-in, ``gesture`` is still
+    # "No hand" (``update`` returns ``_confirmed`` only), and the bar would stay empty.
     bar_y, bar_h = hud_h - 8, 8
     cv2.rectangle(frame, (0, bar_y), (w, bar_y + bar_h), (40, 40, 40), -1)
-    if gfilter is not None and gesture != "No hand":
-        fill = int(gfilter.streak_ratio * w)
+    if gfilter is not None:
+        ratio = (
+            float(hud_streak_ratio)
+            if hud_streak_ratio is not None
+            else float(gfilter.streak_ratio)
+        )
+        ratio = max(0.0, min(1.0, ratio))
+        fill = int(round(ratio * w))
         if fill > 0:
-            bar_color = COMMAND_COLORS.get(command, (100, 100, 100))
+            cand = gfilter.streak_candidate
+            g_label = cand or (gesture if gesture != "No hand" else raw_gesture)
+            cmd_key = GESTURE_TO_COMMAND.get(g_label, command)
+            bar_color = COMMAND_COLORS.get(cmd_key, (100, 100, 100))
             cv2.rectangle(frame, (0, bar_y), (fill, bar_y + bar_h), bar_color, -1)
 
     if bbox is not None:
@@ -784,6 +714,7 @@ def main():
         source_label = f"WEBCAM:{args.camera}"
     else:
         try:
+            import mlx_djitellopy_udp_video  # noqa: F401
             from djitellopy import Tello
         except ImportError:
             print("ERROR: djitellopy not installed. pip install djitellopy")
@@ -815,9 +746,9 @@ def main():
 
     smoother = BboxSmoother(alpha=0.4, max_miss_frames=8)
     gfilter = GestureFilter(
-        window=10,
-        lock_frames=GESTURE_LOCK_FRAMES,
-        unlock_frames=GESTURE_UNLOCK_FRAMES,
+        window_duration_s=GESTURE_WINDOW_SECONDS,
+        lock_seconds=GESTURE_LOCK_SECONDS,
+        unlock_seconds=GESTURE_UNLOCK_SECONDS,
         min_vote_share=0.60,
     )
     drone = DroneState(world_width_m=world_width_m)
@@ -833,6 +764,9 @@ def main():
     loss_streak = 0
     hold_streak = 0
     prev_confirmed_for_fist = None
+    prev_active_for_climb = active_command
+    last_climb_reset_time = None  # monotonic timestamp after reset_after_climb (HUD only)
+    climb_hud_clear_s = 0.3
 
     print("\n" + "=" * 50)
     print("  GESTURE DRONE SIMULATOR")
@@ -841,7 +775,10 @@ def main():
     print(f"  → nominal HVEL ≈ {nominal_forward_m_s:.3f} m/s if MOVE FORWARD were used (SIM_MOVE_SPEED_PX_S={SIM_MOVE_SPEED_PX_S}); peace=FOLLOW_ARM")
     print(f"  → climb / descend rate: {SIM_ALT_SPEED_M_S:.2f} m/s (sim altitude axis)")
     print(f"Confidence threshold: {CONFIDENCE_THRESHOLD * 100:.0f}%")
-    print(f"Gesture lock frames : {GESTURE_LOCK_FRAMES}  unlock: {GESTURE_UNLOCK_FRAMES}")
+    print(
+        f"Gesture lock: {GESTURE_LOCK_SECONDS}s  unlock: {GESTURE_UNLOCK_SECONDS}s  "
+        f"vote window: {GESTURE_WINDOW_SECONDS}s"
+    )
     print(f"Dead-band threshold : 60% weighted vote share")
     print(
         f"Follow latch         : {'ON' if FOLLOW_LATCH_ENABLE else 'OFF'} "
@@ -1112,6 +1049,14 @@ def main():
                 f"fly={int(drone.is_flying)} "
                 f"acq={acq_streak}/{M_ACQUIRE} loss={loss_streak}/{M_LOSS} face_ok={int(face_ok)}"
             )
+            # HUD-only: brief empty bar after climb segment (no reset_after_climb here — keeps sim filter semantics).
+            if prev_active_for_climb == "MOVE UP" and active_command != "MOVE UP":
+                last_climb_reset_time = time.monotonic()
+            hud_streak_ratio = None
+            if last_climb_reset_time is not None and (
+                time.monotonic() - last_climb_reset_time
+            ) < climb_hud_clear_s:
+                hud_streak_ratio = 0.0
             cam_panel = draw_cam_panel(
                 frame_resized,
                 raw_gesture,
@@ -1130,7 +1075,9 @@ def main():
                 yunet_error=yunet_load_error,
                 trust_line=trust_hud,
                 beh_line=beh_hud,
+                hud_streak_ratio=hud_streak_ratio,
             )
+            prev_active_for_climb = active_command
 
             scale_x = cam_w / frame.shape[1]
             scale_y = cam_h / frame.shape[0]

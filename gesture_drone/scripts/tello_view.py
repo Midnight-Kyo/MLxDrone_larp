@@ -5,12 +5,11 @@ Live gesture recognition using the **Tello camera** — **same perception stack 
 **Tello-tuned** MediaPipe thresholds / crop upscale (``trusted_hand_config_tello_camera`` —
 softer on compressed drone video than bridge/webcam). Use ``--no-perception-gate`` or
 ``MLX_GESTURE_PERCEPTION_GATE=0`` only to disable. Use ``--autonomy-preview`` to match
-``tello_real_autonomy_v1.py`` on the ground: **TrustedHand off** + **19/25** GestureFilter
-(no motors).
+``tello_real_autonomy_v1.py`` on the ground: **TrustedHand off** + same **time-based** GestureFilter
+(default **2.0 s** lock / **2.5 s** unlock; no motors).
 
 After **connect**, requests **720p / 30 fps / 5 Mbps** before **streamon** (each command is tried
-separately; some firmware rejects ``setresolution``). Optional ``--enhance-stream``: bilateral +
-unsharp on each frame; cyan **ENHANCED** badge.
+separately; some firmware rejects ``setresolution``).
 
 **No flight commands** in this script (no ROS / TCP).
 
@@ -36,7 +35,8 @@ from pathlib import Path
 from typing import Any
 
 import cv2
-import numpy as np
+
+import mlx_djitellopy_udp_video  # noqa: F401  — FFmpeg UDP FIFO / nonfatal overrun
 from djitellopy import Tello
 
 import hand_detection
@@ -49,9 +49,13 @@ from perception_gating import (
     perception_gate_wanted,
     trusted_hand_config_tello_camera,
 )
+from gesture_filter import (
+    GESTURE_LOCK_SECONDS,
+    GESTURE_UNLOCK_SECONDS,
+    GESTURE_WINDOW_SECONDS,
+    GestureFilter,
+)
 from simulate_drone import (
-    AUTONOMY_GESTURE_LOCK_FRAMES,
-    AUTONOMY_GESTURE_UNLOCK_FRAMES,
     BboxSmoother,
     COMMAND_COOLDOWN,
     CONFIDENCE_THRESHOLD,
@@ -59,13 +63,10 @@ from simulate_drone import (
     FOLLOW_EXIT_MARGIN,
     FOLLOW_LATCH_ENABLE,
     FOLLOW_NO_HAND_FRAMES_TO_DROP,
-    GESTURE_LOCK_FRAMES,
     GESTURE_TO_COMMAND,
-    GESTURE_UNLOCK_FRAMES,
     YUNET_FRAME_STRIDE,
     YUNET_MAX_INFER_SIDE,
     PADDING_RATIO,
-    GestureFilter,
     classify_hand,
     draw_cam_panel,
     load_gesture_model,
@@ -82,49 +83,6 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 MODEL_DIR = SCRIPT_DIR.parent / "models"
 
 FACE_HAND_IOU_MAX = 0.22
-
-#
-# NOTE: Tello preview FPS is usually limited by Wi‑Fi, H.264 decode, and djitellopy — not by
-# bilateral/unsharp on a modern CPU.
-#
-
-
-@dataclass(frozen=True)
-class TelloEnhanceParams:
-    """Bilateral + unsharp for compressed Tello video (see ``enhance_tello_frame_bgr``)."""
-
-    bilateral_d: int = 7
-    bilateral_sigma_color: int = 50
-    bilateral_sigma_space: int = 50
-    unsharp_amount: float = 1.35
-    unsharp_blur_sigma: float = 1.0
-    unsharp_blend_sub: float = 0.35
-
-
-def _bilateral_unsharp(bgr: np.ndarray, p: TelloEnhanceParams) -> np.ndarray:
-    b = cv2.bilateralFilter(
-        bgr,
-        d=p.bilateral_d,
-        sigmaColor=p.bilateral_sigma_color,
-        sigmaSpace=p.bilateral_sigma_space,
-    )
-    blur = cv2.GaussianBlur(b, (0, 0), p.unsharp_blur_sigma)
-    return cv2.addWeighted(b, p.unsharp_amount, blur, -p.unsharp_blend_sub, 0)
-
-
-def enhance_tello_frame_bgr(
-    frame_bgr: np.ndarray,
-    p: TelloEnhanceParams,
-) -> np.ndarray:
-    if frame_bgr is None or frame_bgr.size == 0:
-        return frame_bgr
-    bgr = np.ascontiguousarray(frame_bgr)
-    return _bilateral_unsharp(bgr, p)
-
-
-def tello_enhance_params_from_args(_args: Any) -> TelloEnhanceParams:
-    """Reserved for future CLI tuning; currently returns defaults."""
-    return TelloEnhanceParams()
 
 
 def add_preview_arguments(p: argparse.ArgumentParser) -> None:
@@ -148,17 +106,12 @@ def add_preview_arguments(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument("--no-box-drop", type=int, default=5, help="Trusted-hand no-box drop.")
     p.add_argument(
-        "-E",
-        "--enhance-stream",
-        action="store_true",
-        help="Preprocess frames: bilateral + unsharp (cheap sharpen for compressed video).",
-    )
-    p.add_argument(
         "--autonomy-preview",
         action="store_true",
         help=(
             "Match tello_real_autonomy_v1 on the ground: implies --no-perception-gate (no MediaPipe "
-            "load) and GestureFilter 19/25. Default preview: TrustedHand on + 8/12."
+            "load). GestureFilter uses time-based defaults (2.0s lock / 2.5s unlock). "
+            "Default preview: TrustedHand on; same filter timing as autonomy."
         ),
     )
 
@@ -243,22 +196,11 @@ def run_preview_loop(
     face_detector = perception["face_detector"]
     yunet_load_error = perception["yunet_load_error"]
 
-    lock_f = (
-        AUTONOMY_GESTURE_LOCK_FRAMES
-        if getattr(args, "autonomy_preview", False)
-        else GESTURE_LOCK_FRAMES
-    )
-    unlock_f = (
-        AUTONOMY_GESTURE_UNLOCK_FRAMES
-        if getattr(args, "autonomy_preview", False)
-        else GESTURE_UNLOCK_FRAMES
-    )
-
     smoother = BboxSmoother(alpha=0.4, max_miss_frames=8)
     gfilter = GestureFilter(
-        window=10,
-        lock_frames=lock_f,
-        unlock_frames=unlock_f,
+        window_duration_s=GESTURE_WINDOW_SECONDS,
+        lock_seconds=GESTURE_LOCK_SECONDS,
+        unlock_seconds=GESTURE_UNLOCK_SECONDS,
         min_vote_share=0.60,
     )
     proximity_smoother = ProximitySmoother(alpha=0.35)
@@ -274,15 +216,9 @@ def run_preview_loop(
     last_command_time = 0.0
 
     print("HUD running. Q = quit this window.")
-    en_params = (
-        tello_enhance_params_from_args(args) if args.enhance_stream else None
-    )
-    if args.enhance_stream:
-        print(
-            "  Perception input: enhancement ON — bilateral + unsharp; cyan ENHANCED badge top-left."
-        )
     print(
-        f"GestureFilter: lock={lock_f} unlock={unlock_f}; "
+        f"GestureFilter: lock={GESTURE_LOCK_SECONDS}s unlock={GESTURE_UNLOCK_SECONDS}s "
+        f"window={GESTURE_WINDOW_SECONDS}s; "
         f"conf {CONFIDENCE_THRESHOLD:.0%}; Trusted-hand: "
         f"{'ON' if tgate is not None else 'OFF'}"
     )
@@ -293,9 +229,6 @@ def run_preview_loop(
             if frame_bgr is None or frame_bgr.size == 0:
                 time.sleep(0.01)
                 continue
-
-            if en_params is not None:
-                frame_bgr = enhance_tello_frame_bgr(frame_bgr, en_params)
 
             if time.time() - telem_timer > 3.0:
                 try:
@@ -438,27 +371,6 @@ def run_preview_loop(
                 yunet_error=yunet_load_error,
                 trust_line=trust_hud,
             )
-            if args.enhance_stream:
-                lab = "ENHANCED"
-                (tw, th), _ = cv2.getTextSize(lab, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
-                x0, y0 = 10, 26
-                cv2.rectangle(
-                    frame_bgr,
-                    (x0 - 2, y0 - th - 3),
-                    (x0 + tw + 2, y0 + 3),
-                    (0, 0, 0),
-                    -1,
-                )
-                cv2.putText(
-                    frame_bgr,
-                    lab,
-                    (x0, y0),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
-                    (0, 255, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
             if (follow_arm or hover_face_scan) and face_fb is not None:
                 fx1, fy1, fx2, fy2 = face_fb
                 cv2.rectangle(frame_bgr, (fx1, fy1), (fx2, fy2), (80, 200, 255), 2)
@@ -500,9 +412,8 @@ def main():
     print("=" * 50)
     print()
     print(
-        f"  [flags] enhance_stream={args.enhance_stream}  "
-        f"autonomy_preview={args.autonomy_preview}  "
-        f"(if a flag is False but you passed it, the shell may have dropped args; see "
+        f"  [flags] autonomy_preview={args.autonomy_preview}  "
+        f"(if wrong, the shell may have dropped args; see "
         f"gesture_drone/docs/TELLO_VIEW_DEBUG_HANDOFF.md)"
     )
     print()
@@ -511,15 +422,10 @@ def main():
     if args.autonomy_preview:
         print(
             "  --autonomy-preview: same perception policy as tello_real_autonomy_v1 — "
-            "TrustedHand skipped, GestureFilter 19/25 in the HUD loop."
+            "TrustedHand skipped; GestureFilter time-based (2.0s lock / 2.5s unlock) in the HUD loop."
         )
 
     print()
-    if args.enhance_stream:
-        print(
-            "  Stream enhancement: ON (bilateral + unsharp — FPS usually limited by Wi‑Fi/H.264)"
-        )
-        print()
     print("Connecting to Tello drone…")
     tello = Tello()
     tello.connect()

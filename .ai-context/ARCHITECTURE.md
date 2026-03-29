@@ -2,7 +2,7 @@
 
 ## System Overview
 
-Two machines, one pipeline. Video input is either a **PC webcam** or the **Tello camera**. **Bridge, sim, and `tello_view`** share **`hand_detection.detect_hand`** (same YOLO weights table). **TrustedHand:** bridge/sim use default **`TrustedHandConfig`**; **`tello_view.init_perception`** (and scripts that call it) uses **`trusted_hand_config_tello_camera()`** for compressed Tello video. **`tello_real_autonomy_v1.py`** calls **`init_perception`** then sets **`perception["tgate"] = None`** — **TrustedHand off** in preview and flight; **`AUTONOMY_GESTURE_LOCK_FRAMES = 19`**, **`AUTONOMY_GESTURE_UNLOCK_FRAMES = 25`**. Other **`init_perception`** callers (**e.g. `tello_real_flight_test`**) keep the gate when enabled.
+Two machines, one pipeline. Video input is either a **PC webcam** or the **Tello camera**. **Bridge, sim, and `tello_view`** share **`hand_detection.detect_hand`** (same YOLO weights table). **TrustedHand:** bridge/sim use default **`TrustedHandConfig`**; **`tello_view.init_perception`** (and scripts that call it) uses **`trusted_hand_config_tello_camera()`** for compressed Tello video. **`tello_real_autonomy_v1.py`** calls **`init_perception`** then sets **`perception["tgate"] = None`** — **TrustedHand off** in preview and flight; **`GestureFilter`** still uses **`gesture_filter.py`** defaults (**~2.0 s** lock / **2.5 s** unlock). Other **`init_perception`** callers (**e.g. `tello_real_flight_test`**) keep the gate when enabled.
 
 ```
 WINDOWS (GPU inference)                    WSL2 (Ubuntu 22.04, ROS2 + Gazebo)
@@ -19,18 +19,18 @@ WINDOWS (GPU inference)                    WSL2 (Ubuntu 22.04, ROS2 + Gazebo)
 │    ↓                     │              │  3D Tello drone in pretty.world  │
 │  EfficientNet-B0         │              │                                  │
 │    ↓                     │              │                                  │
-│  GestureFilter → Command │              │                                  │
+│  gesture_filter.GestureFilter → Command │              │                                  │
 │  (two_fingers → YuNet HUD)│             │                                  │
 └──────────────────────────┘              └──────────────────────────────────┘
 ```
 
 **2D simulator** (`simulate_drone.py`): same perception chain; commands drive a **virtual** top-down panel (no TCP). Optional `--source tello`. Optional **fist-toggle** **MANUAL / SEARCH / FACE_LOCK** on sim **heading** (see script; YuNet + `search_behavior`).
 
-**Tello HUD only** (`tello_view.py`): **shared `hand_detection.detect_hand`** + **TrustedHandGate** (Tello-tuned config via **`trusted_hand_config_tello_camera()`**) + YuNet + GestureFilter. On connect: **720p / 30 fps / 5 Mbps** (`djitellopy`), optional **`--enhance-stream`** (bilateral + unsharp). **No** TCP, **no** motors — display and screenshots only.
+**Tello HUD only** (`tello_view.py`): **shared `hand_detection.detect_hand`** + **TrustedHandGate** (Tello-tuned config via **`trusted_hand_config_tello_camera()`**) + YuNet + GestureFilter. On connect: **720p / 30 fps / 5 Mbps** (`djitellopy`). **`mlx_djitellopy_udp_video`** (imported first) widens the FFmpeg UDP FIFO and sets **`overrun_nonfatal=1`** so PyAV decode keeps up with bursty Wi‑Fi H.264; tune with **`MLX_TELLO_UDP_FIFO_BYTES`**. **No** TCP, **no** motors — display and screenshots only.
 
 **Physical Tello (djitellopy, no ROS in repo for flight control):**
 
-- **`tello_real_autonomy_v1.py`** — pre-flight OpenCV preview → takeoff → settle (zero RC) → **SEARCH** (default **`rotate_clockwise` / `rotate_counter_clockwise`** steps; **`--search-mode rc`** for stick yaw) → **FACE_LOCK** (`send_rc_control` yaw only) → **land** (confirmed **open_palm** / **Q** / Ctrl+C). Reuses **`tello_view.init_perception`**, then **clears `tgate`**; **`GestureFilter`** uses **`AUTONOMY_GESTURE_LOCK_FRAMES` / `AUTONOMY_GESTURE_UNLOCK_FRAMES`** (19 / 25).
+- **`tello_real_autonomy_v1.py`** — pre-flight OpenCV preview → takeoff → settle (zero RC) → **SEARCH** (default **`rc`** = continuous yaw via **`send_rc_control`**; **`--search-mode cw`** for discrete **`rotate_clockwise` / `rotate_counter_clockwise`** steps) → **FACE_LOCK** (`send_rc_control` yaw only) → **land** (confirmed **open_palm** / **Q** / Ctrl+C). Uses **`SafeTello`** (subclass of **`djitellopy.Tello`**) for idempotent **`end()`** and safe **`__del__`** after **`MOTOR_STOP`**. Reuses **`tello_view.init_perception`**, then **clears `tgate`**; **`GestureFilter`** from **`gesture_filter.py`** (same time-based defaults as bridge/sim/`tello_view`). Imports **`tello_view`** before **`djitellopy`** so **`mlx_djitellopy_udp_video`** applies. **Worker:** ~**25 Hz**; if yaw is **0** and **~10 s** pass without RC while **not busy**, sends **`send_rc_control(0,0,0,0)`** keepalive — **skipped** when **`command_q`** has items waiting; **`move_up`** uses a **longer** pre-command sleep if the last RC send was that keepalive (avoids **`error Not joystick`**).
 
 - **`tello_hover_baseline.py`** — takeoff → **10 s hover, no `rc` commands** → land (stability baseline).
 
@@ -100,14 +100,14 @@ Rules:
 7. **TrustedHandGate** (`perception_gating.py`): MediaPipe HandLandmarker **verifies** a real hand in the crop **before** classification; temporal trust keys **EfficientNet / GestureFilter** (default **on**; `--no-perception-gate` / `MLX_GESTURE_PERCEPTION_GATE=0` to disable).
 8. Preprocess: `Resize(256)` → `CenterCrop(224)` → `ToTensor` → ImageNet normalize.
 9. EfficientNet-B0 → softmax → class + confidence.
-10. **GestureFilter**: weighted votes × recency, dead-band `min_vote_share=0.60`, lock/unlock hysteresis.
+10. **`GestureFilter`** (**`gesture_filter.py`**): weighted votes × recency over **`window_duration_s`**, dead-band `min_vote_share=0.60`, lock/unlock hysteresis in **seconds** (`GESTURE_LOCK_SECONDS` / `GESTURE_UNLOCK_SECONDS`).
 11. Raw confidence ≥ **`CONFIDENCE_THRESHOLD` (0.85)** required to vote.
 12. **`COMMAND_COOLDOWN` (1.2 s)** between *accepted* command changes (`gesture_bridge.py`, `simulate_drone.py`).
 13. TCP JSON (`gesture_bridge.py`) or sim physics (`simulate_drone.py`).
 
 Per-frame diagnostics: `yolo_n`, `yolo_top_conf`, `yolo_pick_conf`, `face_iou`, `reject_stage` (see **Session diagnostics** in STATUS).
 
-**Gesture lock (aligned across bridge + sim):** `GESTURE_LOCK_FRAMES=8`, `GESTURE_UNLOCK_FRAMES=12`.
+**Gesture lock (aligned across bridge, sim, `tello_view`, autonomy):** defaults in **`gesture_filter.py`**: `GESTURE_LOCK_SECONDS=2.0`, `GESTURE_UNLOCK_SECONDS=2.5`, `GESTURE_WINDOW_SECONDS=0.5`.
 
 ### `tello_view.py` — **`hand_detection.detect_hand`** (same path as bridge/sim for detection)
 
@@ -146,15 +146,14 @@ Inference scripts **auto-pick** `best.pt` when the file exists. **Gesture CNN** 
 
 | Location | Class | Purpose |
 |----------|-------|---------|
-| `simulate_drone.py` | `GestureFilter` | Temporal gating; also duplicated in `gesture_bridge.py` (same logic). |
-| `simulate_drone.py` | `SessionLogger` | Per-frame CSV in `gesture_drone/logs/` (`yolo_*`, `reject_stage`, classifier margin). |
+| `gesture_filter.py` | `GestureFilter` | Time-based confirmation + hysteresis; imported by bridge, sim, `tello_view`, **`tello_real_autonomy_v1`**. |
+| `simulate_drone.py` | `DroneState`, `SessionLogger`, classifier HUD helpers | 2D sim + per-frame CSV in `gesture_drone/logs/`; also **`classify_hand`**, **`draw_cam_panel`**, **`COMMAND_COOLDOWN`**, **`CONFIDENCE_THRESHOLD`**, **`GESTURE_TO_COMMAND`**, YuNet constants — **`tello_real_autonomy_v1`** imports these. **`gesture_bridge`** does **not** use this file for **`GestureFilter`** (that is **`gesture_filter.py`** only). |
 | `hand_detection.py` | `detect_hand` | Shared YOLO crop + filters (bridge, sim, `tello_view`, physical autonomy). |
-| `simulate_drone.py` | `DroneState` | 2D position, altitude, `forward_speed_m_s` / `climb_speed_m_s` for HUD. |
 | All inference scripts | `BboxSmoother` | EMA on YOLO boxes. |
 
 ## File Reference
 
-### Project Root: `/home/kyo/Projects/MLxDrone_larp/`
+### Project Root: `/home/kyo/projects/MLxDrone_larp/` (path may vary by machine / drive letter)
 
 | File | Purpose |
 |------|---------|
@@ -169,16 +168,18 @@ Inference scripts **auto-pick** `best.pt` when the file exists. **Gesture CNN** 
 
 | File | Runs On | Purpose |
 |------|---------|---------|
-| `gesture_bridge.py` | Windows | `hand_detection.detect_hand` + EfficientNet + GestureFilter → TCP. `--source {webcam,tello}`, `--host`, `--port`. **YuNet** + proximity HUD when `two_fingers` confirmed (`yunet_face.py`). |
+| `gesture_filter.py` | Windows | **`GestureFilter`** + time-based defaults; light module (bridge imports it instead of **`simulate_drone`**). |
+| `gesture_bridge.py` | Windows | `hand_detection.detect_hand` + EfficientNet + `gesture_filter.GestureFilter` → TCP. `--source {webcam,tello}`, `--host`, `--port`. **YuNet** + proximity HUD when `two_fingers` confirmed (`yunet_face.py`). |
 | `yunet_face.py` | Windows | YuNet ONNX path, `FaceDetectorYN`, largest face, proximity + EMA. |
 | `gesture_ros2_node.py` | WSL2 | TCP → `cmd_vel` + `tello_action`. |
 | `launch_gazebo_bridge.sh` | WSL2 | Gazebo + `gesture_ros2_node`. `--no-windows` when launched from `launch_all.ps1`. |
 | `launch_all.ps1` | Windows | WSL window + wait on :9090 + `gesture_bridge.py`. **`-CameraIndex`** (default 2), **`-Source {webcam,tello}`**. |
 | `simulate_drone.py` | Windows | 2D sim + `hand_detection` + SessionLogger + scale HUD + `--source` / `--world-width-m`; optional **SEARCH / FACE_LOCK** on heading. |
-| `tello_view.py` | Windows | Tello stream (max video settings before **`streamon`**) + **`hand_detection`** + Tello-tuned TrustedHand + gestures; **`--enhance-stream`** optional; **display only**. |
-| `tello_real_autonomy_v1.py` | Windows | **Physical** djitellopy: preview → takeoff → SEARCH / FACE_LOCK → land; no ROS; **TrustedHand off**; autonomy **GestureFilter** 19 / 25. |
+| `tello_view.py` | Windows | Tello stream (max video settings before **`streamon`**) + **`hand_detection`** + Tello-tuned TrustedHand + gestures; **display only**. |
+| `tello_real_autonomy_v1.py` | Windows | **Physical** djitellopy: preview → takeoff → SEARCH / FACE_LOCK → **thumbs_up** / **open_palm** (queued **`move_up`/`land`** on worker thread); no ROS; **TrustedHand off**; **`gesture_filter` + `simulate_drone`** helpers. |
 | `tello_hover_baseline.py` | Windows | **Physical** djitellopy: takeoff → 10 s hover (**no rc**) → land. |
 | `tello_real_flight_test.py` | Windows | **Physical** djitellopy: minimal takeoff/hover/land; optional `--onboard` HUD. |
+| `mlx_djitellopy_udp_video.py` | Windows | Monkey-patch **`Tello.get_udp_video_address`** (FFmpeg **`fifo_size`** + **`overrun_nonfatal`**). Import **before** `from djitellopy import Tello` (or rely on **`import tello_view`** ahead of djitellopy). |
 | `search_behavior.py` | Windows / WSL | Shared **M_ACQUIRE**, **M_LOSS**, **face_ok_and_x_norm**, **`OMEGA_SEARCH`**, lock gains — sim, ROS node, bridge TCP extras, physical autonomy. |
 | `hand_detection.py` | Windows | Shared detection + `reject_stage` diagnostics (bridge + sim + `tello_view` + physical autonomy). |
 | `perception_gating.py` | Windows | **TrustedHandGate**: MP verifies YOLO crop; `behavior_allow` gates GestureFilter (**on by default**; `--no-perception-gate` or `MLX_GESTURE_PERCEPTION_GATE=0` to disable). Thresholds: `--k-create`, `--mp-miss-drop`, `--no-box-drop`. |
@@ -277,7 +278,7 @@ Two copies often exist; **`$PROFILE` may point at OneDrive**:
 ## Retraining
 
 ```bash
-cd /home/kyo/Projects/MLxDrone_larp && source venv/bin/activate
+cd /home/kyo/projects/MLxDrone_larp && source venv/bin/activate
 python gesture_drone/scripts/train_model.py
 ```
 
@@ -285,7 +286,7 @@ python gesture_drone/scripts/train_model.py
 
 **Scope:** Physical flight uses **djitellopy** in-repo only; there is **no** ROS **`cmd_vel`** path for the real drone in this repo.
 
-- **`tello_real_autonomy_v1.py`:** After connect/stream, **pre-takeoff OpenCV preview** (full HUD). **[T]** arms “ready to fly”; **Enter** in the **console** starts **takeoff**; **[Q]** in the preview window aborts **before** takeoff (**Ctrl+C** aborts preview the same way). Post-takeoff: short settle (**zero RC**), then **SEARCH** (default **discrete `rotate_clockwise` / `rotate_counter_clockwise`** steps to limit stick-coupling drift; **`--search-mode rc`** restores continuous yaw via **`send_rc_control`**), then **FACE_LOCK** (**yaw RC only**). **Land:** GestureFilter-confirmed **open_palm**, or **[Q]** in flight; **Ctrl+C** in flight triggers land, then **`finally`** (zero yaw RC, **`land()`**, **`streamoff`**, **`end()`**, destroy windows). **Perception:** **`perception["tgate"] = None`** after **`init_perception`** — **TrustedHandGate disabled**; **`behavior_allow`** follows YOLO crop only; **`GestureFilter`** lock/unlock **19** / **25** (script constants, not **`simulate_drone`** defaults).
+- **`tello_real_autonomy_v1.py`:** After connect/stream, **pre-takeoff OpenCV preview** (full HUD). **[T]** arms “ready to fly”; **Enter** in the **console** starts **takeoff**; **[Q]** in the preview window aborts **before** takeoff (**Ctrl+C** aborts preview the same way). Post-takeoff: short settle (**zero RC**), then **SEARCH** (default **`rc`** = continuous yaw via **`send_rc_control`**; **`--search-mode cw`** selects discrete SDK rotate steps if **`rc`** causes unwanted lateral drift), then **FACE_LOCK** (**yaw RC only**). **Climb:** confirmed **thumbs_up** enqueues **`("MOVE_UP", cm, False)`**; optional **post-takeoff** climb uses **`(..., True)`** and an explicit **`rc 0 0 0 0`** + longer pre-**`move_up`** delay (see STATUS). **`move_pending`** closes the enqueue race with **`command_busy`**. SDK distances clamped to **≥20 cm**. **Land:** GestureFilter-confirmed **open_palm** (queued **`land`**), or **[Q]** / Ctrl+C; **`finally`** zeros yaw RC, **`streamoff`**, **`end()`**, destroys windows. **Instance:** **`SafeTello()`** (safe teardown). **Perception:** **`perception["tgate"] = None`** — TrustedHand off; **`GestureFilter`** from **`gesture_filter.py`**; classifier/HUD helpers still from **`simulate_drone`**. **Threading:** main loop does perception and pushes **yaw RC** + **`command_q`**; a **~25 Hz worker** runs **`move_up`** / **`land`**, **`send_rc_control`** only when not busy and **yaw ≠ 0**, **keepalive** **`rc 0 0 0 0`** when yaw stays **0** for **~10 s** (see STATUS for skip / **`move_up`** timing), and reports **`MOVE_UP_DONE`** / **`LAND_DONE`** / **`MOTOR_STOP`** (details: STATUS **Physical autonomy v1 — control & threading**). **Logging:** takeoff-relative **`[+t]`** prefixes on flight-loop prints.
 - **`tello_hover_baseline.py`:** **Takeoff → ~10 s hover with no RC → land.** Use as a **stability / battery / link** sanity check before autonomy.
 - **`tello_real_flight_test.py`:** Minimal scripted flight; optional **`--onboard`** HUD — not the main gesture→motor product path.
 
@@ -299,5 +300,7 @@ python gesture_drone/scripts/train_model.py
 | Gazebo “hangs” on launch | Shader compile / cold start | Wait **15–30 s** first open; see STATUS **BUG-3**. |
 | Tello stream: decode / PPS noise, brief **no frame** | H.264 startup | Normal; wait for steady frames. **Autonomy v1** pre-takeoff preview exists partly so you **see video before mounting**. |
 | ROS hover / stop while flying | TCP gap **>3 s** | Restore Windows bridge or network; node forces **STOP** (watchdog). |
-| Physical **SEARCH** drifts sideways | Stick yaw **`rc`** coupling on some firmware/hardware | Prefer default **`--search-mode cw`** (discrete rotations); use **`rc`** only when intentional. |
+| Physical **SEARCH** drifts sideways | Stick yaw **`rc`** coupling on some firmware/hardware | Try **`--search-mode cw`** (discrete SDK rotations) instead of default **`rc`**. |
 | Physical vs **Gazebo** behavior differ | Different stacks | Gazebo uses **ROS** + plugin; real drone uses **djitellopy** — tune and test **each** path separately. |
+| Physical **`move_up` “out of range”** / odd climb | SDK accepts **20–500 cm** only | Autonomy clamps to **`MIN_SDK_MOVE_CM` (20)**; prefer **`--thumbs-up-cm`** ≥ 20. |
+| Bridge import **cost** | Pulling **`simulate_drone`** for **`GestureFilter`** only | Use **`gesture_filter.py`** — **`gesture_bridge`** already does. |

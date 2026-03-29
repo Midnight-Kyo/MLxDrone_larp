@@ -4,14 +4,14 @@ This folder exists for AI assistants. Read these files to understand the project
 
 ## Project in One Paragraph
 
-A hand-gesture-controlled drone system. **YOLOv8n** (HaGRID `best.pt` or HF fallback) proposes the hand box; **`TrustedHandGate`** (**MediaPipe** verifies a real hand in the **YOLO crop**; temporal trust gates **behavior** while YOLO still supplies the classifier crop) runs on **bridge, sim, and `tello_view`**. **`tello_real_autonomy_v1.py`** loads the same **`init_perception`** preset but then **forces `tgate` off** and relies on stricter **`GestureFilter`** lock/unlock instead (see STATUS). Upstream: **`hand_detection.py`** (geometry, optional **YuNet**, `BboxSmoother`, square crop) — used by **bridge, sim, `tello_view`, and `tello_real_autonomy_v1`**. **EfficientNet-B0** classifies; **GestureFilter** gates commands. TrustedHand on bridge/sim/`tello_view` strongly suppresses YOLO false positives **without** room-specific YOLO hard-negative retraining.
+A hand-gesture-controlled drone system. **YOLOv8n** (HaGRID `best.pt` or HF fallback) proposes the hand box; **`TrustedHandGate`** (**MediaPipe** verifies a real hand in the **YOLO crop**; temporal trust gates **behavior** while YOLO still supplies the classifier crop) runs on **bridge, sim, and `tello_view`**. **`tello_real_autonomy_v1.py`** loads the same **`init_perception`** preset but then **forces `tgate` off** — **YOLO-only `behavior_allow`**, while **`GestureFilter`** (**`gesture_filter.py`**, time-based lock/unlock) stays aligned with bridge/sim/preview defaults (see STATUS). Upstream: **`hand_detection.py`** (geometry, optional **YuNet**, `BboxSmoother`, square crop) — used by **bridge, sim, `tello_view`, and `tello_real_autonomy_v1`**. **EfficientNet-B0** classifies; **`GestureFilter`** gates commands. TrustedHand on bridge/sim/`tello_view` strongly suppresses YOLO false positives **without** room-specific YOLO hard-negative retraining.
 
 **Execution paths:**
 
 - **2D OpenCV simulator** (`simulate_drone.py`, no ROS) — optional **MANUAL / SEARCH / FACE_LOCK** on **`drone.heading`** (yaw-only sim semantics).
 - **Gazebo + ROS2** (Windows `gesture_bridge.py` → TCP → WSL2 `gesture_ros2_node.py` → `/drone1/cmd_vel` + `tello_action`) — **SEARCH / FACE_LOCK** via **`angular.z`** when fist-edge + face fields drive autonomy on the **simulated** drone.
 - **Tello camera preview** (`tello_view.py`) — **no** flight; same perception stack as sim/bridge (Shared **`hand_detection`**, TrustedHand, YuNet).
-- **Physical Tello (djitellopy, no ROS):** **`tello_real_autonomy_v1.py`** — preview → takeoff → **SEARCH** (default **cw/ccw** SDK steps; optional **`--search-mode rc`**) → **FACE_LOCK** (**`send_rc_control`** yaw only) → land on confirmed **open_palm** / **Q** / Ctrl+C; **no TrustedHand**; **`AUTONOMY_GESTURE_*` 19/25** (see STATUS). **`tello_hover_baseline.py`** — connect, takeoff, **10 s hover, no RC**, land (stability sanity check). **`tello_real_flight_test.py`** — minimal takeoff/hover/land and optional onboard HUD.
+- **Physical Tello (djitellopy, no ROS):** **`tello_real_autonomy_v1.py`** — preview → takeoff → **SEARCH** / **FACE_LOCK** (yaw RC; **`rc`** vs **`cw`** modes) → **thumbs_up** / **open_palm** drive a **background worker** (**`move_up`** / **`land`**) so the main loop stays on camera inference; **no TrustedHand**; **`gesture_filter` + partial `simulate_drone`** imports (see STATUS **Physical autonomy v1**). Land **Q** / Ctrl+C. **`mlx_djitellopy_udp_video`** stabilizes the Tello H.264 UDP URL for PyAV (via **`tello_view`** / bridge / sim). **`tello_hover_baseline.py`** — **10 s hover, no RC**. **`tello_real_flight_test.py`** — minimal flight + optional **`--onboard`**.
 
 Perception can use a **PC webcam** or the **Tello camera** (`--source tello` on `gesture_bridge.py` and `simulate_drone.py`; Gazebo via `launch_all.ps1 -Source tello` or `drone -Tello`). Pipeline spans **Windows** (inference, physical Tello) and **WSL2 Ubuntu 22.04** (ROS2/Gazebo).
 
@@ -24,13 +24,13 @@ Perception can use a **PC webcam** or the **Tello camera** (`--source tello` on 
 | open_palm                | LAND         | Descend and land                     |
 | thumbs_up                | MOVE_UP      | Take off if landed, then ascend      |
 
-*(Physical autonomy `tello_real_autonomy_v1.py` only uses **open_palm** for land among gestures; other mapped gestures are HUD-only there.)*
+*On the **real drone**, **`tello_real_autonomy_v1.py`** uses **fist** (→ SEARCH), **thumbs_up** (→ queued **`move_up`**), **open_palm** (→ queued **land**). It does **not** mirror Gazebo’s **`two_fingers` → FOLLOW_ARM** product path.*
 
 ## Read Order
 
 1. **PERSONALITY.md** -- How to communicate with this user. Read this first, every time.
 2. **ARCHITECTURE.md** -- System design, data flows, every file and what it does, environment setup, build instructions.
-3. **STATUS.md** -- What works now, what's broken, session-log diagnostics, dataset stats, prioritized next steps. **This file is the living document -- update it after completing any work.**
+3. **STATUS.md** -- What works now, what's broken, session-log diagnostics, dataset stats, prioritized next steps. **This file is the living document -- update it after completing any work.** For gesture timing and **`tello_real_autonomy_v1`** control flow, read **Gesture Confirmation System** and **Physical autonomy v1 — control & threading** in that file.
 
 ## Human-Readable Docs (for the user, not for you)
 
@@ -61,3 +61,4 @@ After completing any task:
 4. **Simulated drone:** **`drone`** / **`launch_all.ps1`** — Windows bridge → TCP **:9090** → WSL **`gesture_ros2_node.py`** + Gazebo (ARCHITECTURE **Running**).
 5. **Physical Tello:** run **`tello_hover_baseline.py`** (hover, no RC) before **`tello_real_autonomy_v1.py`**; read ARCHITECTURE **Physical Tello — behavior and constraints** and **Troubleshooting (minimal)** first.
 6. **TrustedHand design:** `gesture_drone/docs/PERCEPTION_GATING_DESIGN.md` — parameters and rationale beyond the summary in ARCHITECTURE.
+7. **Gesture module split:** **`gesture_filter.py`** = **`GestureFilter`** only (bridge-safe). **`simulate_drone.py`** still holds classifier session helpers **`tello_real_autonomy_v1`** reuses — see STATUS/ARCHITECTURE if moving imports.

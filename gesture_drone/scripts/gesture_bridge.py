@@ -35,6 +35,12 @@ from torchvision.models import efficientnet_b0
 
 import hand_detection
 from hand_detection import detect_hand
+from gesture_filter import (
+    GESTURE_LOCK_SECONDS,
+    GESTURE_UNLOCK_SECONDS,
+    GESTURE_WINDOW_SECONDS,
+    GestureFilter,
+)
 from perception_gating import (
     TrustedHandConfig,
     TrustedHandGate,
@@ -64,9 +70,7 @@ PADDING_RATIO = 0.08   # YOLO boxes already contain the full hand; less padding 
 
 CONFIDENCE_THRESHOLD = 0.85
 # Keep in sync with simulate_drone.py (conservative command spacing).
-COMMAND_COOLDOWN       = 1.2
-GESTURE_LOCK_FRAMES    = 8
-GESTURE_UNLOCK_FRAMES = 12
+COMMAND_COOLDOWN = 1.2
 
 # Reject YOLO "hand" boxes that overlap the YuNet face box (face mis-detected as hand).
 FACE_HAND_IOU_MAX = 0.22
@@ -193,73 +197,6 @@ class BboxSmoother:
     def reset(self):
         self._smooth = None
         self._misses = 0
-
-
-class GestureFilter:
-    """
-    Confidence-weighted, recency-biased sliding-window gesture filter with
-    dead-band and asymmetric hysteresis. Identical to the version in simulate_drone.py.
-
-    Prevents rapid-fire commands to the drone during gesture transitions.
-    """
-    def __init__(self, window=10, lock_frames=GESTURE_LOCK_FRAMES,
-                 unlock_frames=GESTURE_UNLOCK_FRAMES, min_vote_share=0.60):
-        self._window         = window
-        self._lock_frames    = lock_frames
-        self._unlock_frames  = unlock_frames
-        self._min_vote_share = min_vote_share
-        self._history        = []
-        self._streak         = 0
-        self._streak_cand    = None
-        self._confirmed      = None
-        self._lock_target    = lock_frames
-
-    def update(self, gesture, confidence=1.0):
-        label = gesture if gesture is not None else "__none__"
-        conf  = float(confidence) if confidence is not None else 0.0
-        self._history.append((label, conf))
-        if len(self._history) > self._window:
-            self._history.pop(0)
-
-        n = len(self._history)
-        vote_totals  = {}
-        total_weight = 0.0
-        for i, (g, c) in enumerate(self._history):
-            recency = 0.5 + 0.5 * (i / max(1, n - 1))
-            w = c * recency
-            vote_totals[g]  = vote_totals.get(g, 0.0) + w
-            total_weight   += w
-
-        winner       = max(vote_totals, key=vote_totals.get)
-        winner_share = vote_totals[winner] / total_weight if total_weight > 0 else 0.0
-        winner_gest  = winner if winner != "__none__" else None
-
-        if winner_share < self._min_vote_share:
-            self._streak      = 0
-            self._streak_cand = None
-            return self._confirmed
-
-        if self._confirmed is not None and winner_gest != self._confirmed:
-            self._lock_target = self._unlock_frames
-        else:
-            self._lock_target = self._lock_frames
-
-        if winner_gest == self._streak_cand:
-            self._streak += 1
-        else:
-            self._streak_cand = winner_gest
-            self._streak      = 1
-
-        if self._streak >= self._lock_target:
-            self._confirmed = winner_gest
-
-        return self._confirmed
-
-    @property
-    def streak_ratio(self):
-        if self._lock_target == 0:
-            return 0.0
-        return min(1.0, self._streak / self._lock_target)
 
 
 @torch.no_grad()
@@ -437,14 +374,18 @@ def draw_hud(frame, raw_gesture, gesture, confidence, command, fps, connected, g
             cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 200, 100), 1,
         )
 
-    # Confirmation progress bar
+    # Confirmation progress bar (same semantics as simulate_drone.draw_cam_panel)
     bar_y, bar_h = hud_h - 8, 8
     cv2.rectangle(frame, (0, bar_y), (w, bar_y + bar_h), (40, 40, 40), -1)
-    if gfilter is not None and gesture != "No hand":
-        fill = int(gfilter.streak_ratio * w)
+    if gfilter is not None:
+        ratio = float(gfilter.streak_ratio)
+        fill = int(round(ratio * w))
         if fill > 0:
-            cv2.rectangle(frame, (0, bar_y), (fill, bar_y + bar_h),
-                          COMMAND_COLORS.get(command, (100, 100, 100)), -1)
+            cand = gfilter.streak_candidate
+            g_label = cand or (gesture if gesture != "No hand" else raw_gesture)
+            cmd_key = GESTURE_TO_COMMAND.get(g_label, command)
+            bar_color = COMMAND_COLORS.get(cmd_key, (100, 100, 100))
+            cv2.rectangle(frame, (0, bar_y), (fill, bar_y + bar_h), bar_color, -1)
 
 
 def main():
@@ -528,6 +469,7 @@ def main():
         video_label = f"WEBCAM:{args.camera}"
     else:
         try:
+            import mlx_djitellopy_udp_video  # noqa: F401
             from djitellopy import Tello
         except ImportError:
             print("ERROR: pip install djitellopy")
@@ -567,8 +509,12 @@ def main():
     latest_beh_dbg = {}
 
     smoother = BboxSmoother(alpha=0.4, max_miss_frames=8)
-    gfilter  = GestureFilter(window=10, lock_frames=GESTURE_LOCK_FRAMES,
-                             unlock_frames=GESTURE_UNLOCK_FRAMES, min_vote_share=0.60)
+    gfilter = GestureFilter(
+        window_duration_s=GESTURE_WINDOW_SECONDS,
+        lock_seconds=GESTURE_LOCK_SECONDS,
+        unlock_seconds=GESTURE_UNLOCK_SECONDS,
+        min_vote_share=0.60,
+    )
     face_detector = None
     proximity_smoother = ProximitySmoother(alpha=0.35)
     yunet_load_error = None
@@ -594,7 +540,10 @@ def main():
     print(f"Video: {args.source}" + (f" (index {args.camera})" if args.source == "webcam" else ""))
     print(f"Sending commands to {host}:{args.port}")
     print(f"Confidence threshold : {CONFIDENCE_THRESHOLD * 100:.0f}%")
-    print(f"Gesture lock frames  : {GESTURE_LOCK_FRAMES}  unlock: {GESTURE_UNLOCK_FRAMES}")
+    print(
+        f"Gesture lock : {GESTURE_LOCK_SECONDS}s  unlock: {GESTURE_UNLOCK_SECONDS}s  "
+        f"vote window: {GESTURE_WINDOW_SECONDS}s"
+    )
     print(f"Dead-band threshold  : 60% weighted vote share")
     if args.source == "webcam":
         print(

@@ -56,6 +56,7 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
+        import mlx_djitellopy_udp_video  # noqa: F401
         from djitellopy import Tello
     except ImportError:
         print("ERROR: pip install djitellopy", file=sys.stderr)

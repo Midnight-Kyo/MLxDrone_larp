@@ -1,13 +1,13 @@
 r"""
 Physical Tello — v1 autonomy (no ROS): **take off** → **IDLE** (zero sticks) until you gesture.
 Confirmed **fist** starts **SEARCH** (slow yaw for a face) → **FACE_LOCK**.
-**Thumbs up → climb** when ``GestureFilter`` promotes ``thumbs_up`` to ``_confirmed`` (same hysteresis as
-other gestures), then one ``move_up(``\ ``--thumbs-up-cm``\ ``)``; **COMMAND_COOLDOWN** between climbs.
+**Thumbs up → climb** when ``GestureFilter`` confirms ``thumbs_up``, then one ``move_up(``\ ``--thumbs-up-cm``\ ``)``;
+**COMMAND_COOLDOWN** and queue/discretionary gates throttle climbs.
 Confirmed **open_palm** **lands**. **Q** / Ctrl+C lands.
 
 - Reuses ``tello_view.init_perception`` (YOLO + YuNet + GestureFilter + classifier).
-- **TrustedHandGate is off** (``perception["tgate"] = None`` after init); **GestureFilter** uses
-  ``AUTONOMY_GESTURE_*`` from ``simulate_drone`` (19 / 25).
+- **TrustedHandGate is off** (``perception["tgate"] = None`` after init); **GestureFilter** is
+  time-based (``gesture_filter.py``: default **2.0 s** lock, **2.5 s** unlock).
 - SEARCH default: **continuous RC yaw**; optional **--search-mode cw** for SDK rotate steps.
 - After **FACE_LOCK**, if the face is lost long enough, behavior returns to **SEARCH** (not IDLE).
 
@@ -21,8 +21,10 @@ Preview CLI flags match ``tello_view.add_preview_arguments`` (see ``--help``); T
 from __future__ import annotations
 
 import argparse
+import queue
 import signal
 import sys
+import threading
 import time
 from typing import Any
 
@@ -38,9 +40,13 @@ from search_behavior import (
     KP_LOCK,
     face_ok_and_x_norm,
 )
+from gesture_filter import (
+    GESTURE_LOCK_SECONDS,
+    GESTURE_UNLOCK_SECONDS,
+    GESTURE_WINDOW_SECONDS,
+    GestureFilter,
+)
 from simulate_drone import (
-    AUTONOMY_GESTURE_LOCK_FRAMES,
-    AUTONOMY_GESTURE_UNLOCK_FRAMES,
     BboxSmoother,
     COMMAND_COOLDOWN,
     CONFIDENCE_THRESHOLD,
@@ -48,7 +54,6 @@ from simulate_drone import (
     YUNET_FRAME_STRIDE,
     YUNET_MAX_INFER_SIDE,
     PADDING_RATIO,
-    GestureFilter,
     classify_hand,
     draw_cam_panel,
 )
@@ -70,9 +75,38 @@ MAX_SDK_MOVE_CM = 500
 
 # Pause RC updates before ``move_*`` so the firmware is not in joystick mode.
 RC_GAP_BEFORE_MOVE_UP_S = 0.45
+# Longer settle after ``send_rc_control(0,0,0,0)`` keepalive to avoid ``error Not joystick`` on ``move_up``.
+RC_GAP_BEFORE_MOVE_UP_AFTER_KEEPALIVE_S = 1.15
+# After takeoff settle (no RC), explicit zero RC then this sleep before first ``move_up`` (Not joystick).
+RC_GAP_BEFORE_POST_TAKEOFF_MOVE_UP_S = 1.25
 RC_GAP_AFTER_MOVE_UP_S = 0.12
+# HUD-only: after reset_after_climb, force empty streak bar this long (filter still accumulates).
+CLIMB_HUD_STREAK_CLEAR_S = 0.3
 
 _stop_requested = False
+
+
+class SafeTello(Tello):
+    """Tello with idempotent ``end()`` and destructor that won't crash after UDP teardown."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._released = False
+
+    def end(self) -> None:  # noqa: D102
+        if self._released:
+            return
+        self._released = True
+        try:
+            super().end()
+        except (KeyError, Exception):
+            pass
+
+    def __del__(self) -> None:  # noqa: D105
+        try:
+            super().__del__()
+        except (KeyError, Exception):
+            pass
 
 
 def _on_sigint(signum, frame) -> None:  # noqa: ARG001
@@ -86,8 +120,201 @@ def _clamp_rc(v: int) -> int:
 
 
 def _send_yaw_only(tello: Tello, yaw_rc: int) -> None:
-    """Hover: all translation axes zero; yaw-only per v1 spec."""
+    """Send RC directly (e.g. finally after RC worker has stopped). Hover: yaw-only."""
     tello.send_rc_control(0, 0, 0, _clamp_rc(yaw_rc))
+
+
+def _publish_yaw_rc(rc_lock: threading.Lock, latest_holder: list[int], yaw_rc: int) -> None:
+    """Thread 1: update commanded yaw for the RC worker (send_rc_control happens in Thread 2)."""
+    with rc_lock:
+        latest_holder[0] = _clamp_rc(yaw_rc)
+
+
+def _is_motor_stop_error(exc: BaseException) -> bool:
+    """Firmware safety auto-land: SDK responses like 'error Motor stop'."""
+    return "motor stop" in str(exc).lower()
+
+
+def _flight_ts(takeoff_mono: float | None) -> str:
+    if takeoff_mono is None:
+        return ""
+    return f"[+{time.monotonic() - takeoff_mono:.3f}] "
+
+
+def _flight_print(takeoff_mono: float | None, msg: str, **kwargs) -> None:
+    print(_flight_ts(takeoff_mono) + msg, **kwargs)
+
+
+def _worker_blocking_print(takeoff_mono: float, msg: str) -> None:
+    print(f"[+{time.monotonic() - takeoff_mono:.3f}] {msg}", flush=True)
+
+
+def _rc_worker_loop(
+    tello: Tello,
+    rc_lock: threading.Lock,
+    latest_yaw_rc: list[int],
+    command_busy: threading.Event,
+    shutdown_ev: threading.Event,
+    command_q: queue.Queue,
+    result_q: queue.Queue,
+    takeoff_mono: float,
+) -> None:
+    """Thread 2: dispatch command_queue (MOVE_UP, LAND); ~25 Hz RC when not busy; yaw 0 = no send.
+
+    When yaw is 0 (IDLE hover), no RC was being sent and the firmware auto-lands after ~15s without
+    stick traffic. A ``send_rc_control(0,0,0,0)`` keepalive runs if no RC for 10s while not busy.
+    """
+    period_s = 1.0 / 25.0
+    last_rc_send_monotonic = time.monotonic()
+    last_rc_was_keepalive = False
+    while not shutdown_ev.is_set():
+        t0 = time.time()
+        cmd = None
+        try:
+            cmd = command_q.get_nowait()
+        except queue.Empty:
+            pass
+
+        if cmd is not None:
+            if cmd[0] == "MOVE_UP":
+                command_busy.set()
+                while True:
+                    dist = int(cmd[1])
+                    post_takeoff_settle = len(cmd) >= 3 and bool(cmd[2])
+                    ok = True
+                    try:
+                        _move_up_with_rc_gap(
+                            tello,
+                            dist,
+                            after_keepalive_rc=last_rc_was_keepalive,
+                            post_takeoff_settle=post_takeoff_settle,
+                        )
+                    except Exception as e:
+                        if _is_motor_stop_error(e):
+                            command_busy.clear()
+                            _worker_blocking_print(
+                                takeoff_mono,
+                                f"  [!] [worker] Motor stop (firmware safety): {e}",
+                            )
+                            try:
+                                result_q.put(("MOTOR_STOP", None), timeout=2.0)
+                            except queue.Full:
+                                pass
+                            shutdown_ev.set()
+                            return
+                        _worker_blocking_print(
+                            takeoff_mono,
+                            f"  [!] [worker] move_up failed: {e}",
+                        )
+                        ok = False
+                    finally:
+                        last_rc_was_keepalive = False
+                    try:
+                        result_q.put(("MOVE_UP_DONE", ok), timeout=2.0)
+                    except queue.Full:
+                        _worker_blocking_print(
+                            takeoff_mono,
+                            "  [!] [worker] result_queue full (MOVE_UP_DONE)",
+                        )
+                    try:
+                        nxt = command_q.get_nowait()
+                    except queue.Empty:
+                        command_busy.clear()
+                        cmd = None
+                        break
+                    if nxt[0] == "MOVE_UP":
+                        cmd = nxt
+                        continue
+                    command_busy.clear()
+                    cmd = nxt
+                    break
+
+            if cmd is not None and cmd[0] == "LAND":
+                while True:
+                    try:
+                        command_q.get_nowait()
+                    except queue.Empty:
+                        break
+                command_busy.set()
+                ok_land = True
+                try:
+                    tello.land()
+                except Exception as e:
+                    if _is_motor_stop_error(e):
+                        _worker_blocking_print(
+                            takeoff_mono,
+                            f"  [!] [worker] Motor stop (during land): {e}",
+                        )
+                        ok_land = False
+                        try:
+                            result_q.put(("MOTOR_STOP", None), timeout=2.0)
+                        except queue.Full:
+                            pass
+                        command_busy.clear()
+                        shutdown_ev.set()
+                        return
+                    _worker_blocking_print(
+                        takeoff_mono,
+                        f"  [!] [worker] land failed: {e}",
+                    )
+                    ok_land = False
+                command_busy.clear()
+                try:
+                    result_q.put(("LAND_DONE", ok_land), timeout=2.0)
+                except queue.Full:
+                    _worker_blocking_print(
+                        takeoff_mono,
+                        "  [!] [worker] result_queue full (LAND_DONE)",
+                    )
+                shutdown_ev.set()
+                return
+
+            elapsed = time.time() - t0
+            rem = period_s - elapsed
+            if rem > 0:
+                time.sleep(rem)
+            continue
+
+        if not command_busy.is_set():
+            with rc_lock:
+                y = latest_yaw_rc[0]
+            now_m = time.monotonic()
+            if y != 0:
+                try:
+                    tello.send_rc_control(0, 0, 0, _clamp_rc(y))
+                    last_rc_send_monotonic = now_m
+                    last_rc_was_keepalive = False
+                except Exception as e:
+                    if _is_motor_stop_error(e):
+                        print(f"  [!] [worker] Motor stop (RC): {e}", flush=True)
+                        try:
+                            result_q.put(("MOTOR_STOP", None), timeout=2.0)
+                        except queue.Full:
+                            pass
+                        shutdown_ev.set()
+                        return
+            elif (
+                command_q.qsize() == 0
+                and now_m - last_rc_send_monotonic >= 10.0
+            ):
+                try:
+                    tello.send_rc_control(0, 0, 0, 0)
+                    last_rc_send_monotonic = time.monotonic()
+                    last_rc_was_keepalive = True
+                except Exception as e:
+                    if _is_motor_stop_error(e):
+                        print(f"  [!] [worker] Motor stop (RC keepalive): {e}", flush=True)
+                        try:
+                            result_q.put(("MOTOR_STOP", None), timeout=2.0)
+                        except queue.Full:
+                            pass
+                        shutdown_ev.set()
+                        return
+
+        elapsed = time.time() - t0
+        rem = period_s - elapsed
+        if rem > 0:
+            time.sleep(rem)
 
 
 def _sdk_move_dist_cm(dist: int, cap_cm: int) -> int:
@@ -98,11 +325,36 @@ def _sdk_move_dist_cm(dist: int, cap_cm: int) -> int:
     return max(MIN_SDK_MOVE_CM, min(upper, dist))
 
 
-def _move_up_with_rc_gap(tello: Tello, dist_cm: int) -> None:
+def _may_enqueue_discretionary_move(
+    command_busy: threading.Event,
+    command_q: queue.Queue,
+    move_pending: threading.Event,
+) -> bool:
+    """Thread 1 may ``put`` a non-LAND command only when the worker is idle, queue empty, and no MOVE_UP in flight."""
+    return (
+        not command_busy.is_set()
+        and command_q.qsize() == 0
+        and not move_pending.is_set()
+    )
+
+
+def _move_up_with_rc_gap(
+    tello: Tello,
+    dist_cm: int,
+    *,
+    after_keepalive_rc: bool = False,
+    post_takeoff_settle: bool = False,
+) -> None:
     """Do not call ``send_rc_control`` immediately before ``move_up`` — sleep first, then resume RC after."""
     if dist_cm <= 0:
         return
-    time.sleep(RC_GAP_BEFORE_MOVE_UP_S)
+    if post_takeoff_settle:
+        tello.send_rc_control(0, 0, 0, 0)
+        time.sleep(RC_GAP_BEFORE_POST_TAKEOFF_MOVE_UP_S)
+    elif after_keepalive_rc:
+        time.sleep(RC_GAP_BEFORE_MOVE_UP_AFTER_KEEPALIVE_S)
+    else:
+        time.sleep(RC_GAP_BEFORE_MOVE_UP_S)
     tello.move_up(int(dist_cm))
     time.sleep(RC_GAP_AFTER_MOVE_UP_S)
 
@@ -258,9 +510,9 @@ def run_pre_takeoff_preview(
 
     smoother = BboxSmoother(alpha=0.4, max_miss_frames=8)
     gfilter = GestureFilter(
-        window=10,
-        lock_frames=AUTONOMY_GESTURE_LOCK_FRAMES,
-        unlock_frames=AUTONOMY_GESTURE_UNLOCK_FRAMES,
+        window_duration_s=GESTURE_WINDOW_SECONDS,
+        lock_seconds=GESTURE_LOCK_SECONDS,
+        unlock_seconds=GESTURE_UNLOCK_SECONDS,
         min_vote_share=0.60,
     )
     telem_timer = time.time()
@@ -411,6 +663,11 @@ def main() -> int:
     args = parse_args()
     signal.signal(signal.SIGINT, _on_sigint)
 
+    rc_thread: threading.Thread | None = None
+    shutdown_rc: threading.Event | None = None
+    rc_lock: threading.Lock | None = None
+    latest_yaw_holder: list[int] | None = None
+
     try:
         perception = tello_view.init_perception(args)
     except Exception as e:
@@ -433,7 +690,7 @@ def main() -> int:
     print("In flight: OPEN PALM (confirmed) to land; Q / Ctrl+C lands.")
     input("Press Enter to CONNECT (no takeoff yet)...")
 
-    tello = Tello()
+    tello = SafeTello()
     tello.connect()
     bat = tello.get_battery()
     tmp = tello.get_temperature()
@@ -466,9 +723,9 @@ def main() -> int:
 
     smoother = BboxSmoother(alpha=0.4, max_miss_frames=8)
     gfilter = GestureFilter(
-        window=10,
-        lock_frames=AUTONOMY_GESTURE_LOCK_FRAMES,
-        unlock_frames=AUTONOMY_GESTURE_UNLOCK_FRAMES,
+        window_duration_s=GESTURE_WINDOW_SECONDS,
+        lock_seconds=GESTURE_LOCK_SECONDS,
+        unlock_seconds=GESTURE_UNLOCK_SECONDS,
         min_vote_share=0.60,
     )
 
@@ -514,25 +771,63 @@ def main() -> int:
     )
     input()
 
+    land_enqueued = False
+    command_queue: queue.Queue | None = None
+    result_queue: queue.Queue | None = None
+    takeoff_monotonic: float | None = None
+
     try:
         tello.takeoff()
+        takeoff_monotonic = time.monotonic()
+        flight_t0: float = takeoff_monotonic
         airborne = True
         settle_deadline = time.time() + max(0.0, args.settle_s)
         state = "TAKEOFF"
-        print(
-            f"  Takeoff issued — settling {args.settle_s:.1f}s with zero RC, then **IDLE** "
-            f"(fist->SEARCH, thumbs_up->move_up {args.thumbs_up_cm}cm)."
+
+        rc_lock = threading.Lock()
+        latest_yaw_holder = [0]
+        command_busy = threading.Event()
+        shutdown_rc = threading.Event()
+        command_queue = queue.Queue(maxsize=4)
+        result_queue = queue.Queue(maxsize=4)
+        move_pending = threading.Event()
+        rc_thread = threading.Thread(
+            target=_rc_worker_loop,
+            args=(
+                tello,
+                rc_lock,
+                latest_yaw_holder,
+                command_busy,
+                shutdown_rc,
+                command_queue,
+                result_queue,
+                flight_t0,
+            ),
+            daemon=True,
+            name="tello_rc",
         )
-        print(
+        rc_thread.start()
+        assert command_queue is not None and result_queue is not None
+
+        _flight_print(
+            flight_t0,
+            f"  Takeoff issued — settling {args.settle_s:.1f}s with zero RC, then **IDLE** "
+            f"(fist->SEARCH, thumbs_up->move_up {args.thumbs_up_cm}cm).",
+            flush=True,
+        )
+        _flight_print(
+            flight_t0,
             f"  When SEARCH runs: {args.search_mode}"
             + (
                 f" ({args.search_cw_degrees}° / {args.search_cw_interval:.2f}s, sign={'cw' if args.search_yaw_rc >= 0 else 'ccw'})"
                 if args.search_mode == "cw"
                 else f" (yaw_rc={args.search_yaw_rc})"
-            )
+            ),
+            flush=True,
         )
 
         last_search_cw_time = 0.0
+        last_climb_reset_time = None  # time.monotonic() after successful MOVE_UP_DONE + reset_after_climb
 
         while True:
             frame_bgr = frame_reader.frame
@@ -554,8 +849,45 @@ def main() -> int:
                     pass
                 telem_timer = now
                 if airborne and battery < max(10, args.min_battery - 5):
-                    print(f"  [!] Low battery ({battery}%) — landing.")
+                    _flight_print(
+                        flight_t0,
+                        f"  [!] Low battery ({battery}%) — landing.",
+                        flush=True,
+                    )
                     state = "LAND"
+
+            motor_stop_exit = False
+            while True:
+                try:
+                    msg = result_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if msg[0] == "MOVE_UP_DONE":
+                    _flight_print(
+                        flight_t0,
+                        f"  [result] MOVE_UP_DONE success={msg[1]}",
+                        flush=True,
+                    )
+                    move_pending.clear()
+                    if msg[1]:
+                        gfilter.reset_after_climb()
+                        last_climb_reset_time = time.monotonic()
+                elif msg[0] == "LAND_DONE":
+                    _flight_print(
+                        flight_t0,
+                        f"  [result] LAND_DONE success={msg[1]}",
+                        flush=True,
+                    )
+                elif msg[0] == "MOTOR_STOP":
+                    _flight_print(
+                        flight_t0,
+                        "  [result] MOTOR_STOP (firmware safety — drone on ground)",
+                        flush=True,
+                    )
+                    motor_stop_exit = True
+            if motor_stop_exit:
+                airborne = False
+                break
 
             fh, fw = frame_bgr.shape[0], frame_bgr.shape[1]
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -617,29 +949,55 @@ def main() -> int:
                 state = "LAND"
 
             if state in ("IDLE", "SEARCH", "FACE_LOCK"):
-                if gfilter._confirmed == "open_palm" and (now - last_land_fire) >= COMMAND_COOLDOWN:
-                    print("  Land trigger: open_palm (confirmed)")
+                if gfilter.confirmed == "open_palm" and (now - last_land_fire) >= COMMAND_COOLDOWN:
+                    _flight_print(
+                        flight_t0,
+                        "  Land trigger: open_palm (confirmed)",
+                        flush=True,
+                    )
                     state = "LAND"
                     last_land_fire = now
 
-            if state in ("IDLE", "SEARCH", "FACE_LOCK", "TAKEOFF"):
-                if gfilter._confirmed == "thumbs_up" and (
+            if (
+                airborne
+                and state in ("IDLE", "SEARCH", "FACE_LOCK", "TAKEOFF")
+            ):
+                if gfilter.confirmed == "thumbs_up" and (
                     now - last_move_up_time
                 ) >= COMMAND_COOLDOWN:
-                    up_cm = _sdk_move_dist_cm(args.thumbs_up_cm, MAX_THUMBS_UP_CM)
-                    print(
-                        f"  Climb trigger: thumbs_up (confirmed) -> move_up({up_cm} cm)",
-                        flush=True,
-                    )
-                    try:
-                        _move_up_with_rc_gap(tello, up_cm)
-                    except Exception as e:
-                        print(f"  [!] move_up (thumbs_up) failed: {e}", flush=True)
-                    last_move_up_time = now
+                    if _may_enqueue_discretionary_move(
+                        command_busy, command_queue, move_pending
+                    ):
+                        up_cm = _sdk_move_dist_cm(args.thumbs_up_cm, MAX_THUMBS_UP_CM)
+                        _flight_print(
+                            flight_t0,
+                            f"  Climb trigger: thumbs_up (confirmed) -> queue MOVE_UP {up_cm} cm",
+                            flush=True,
+                        )
+                        try:
+                            command_queue.put(("MOVE_UP", up_cm, False), timeout=0.5)
+                            move_pending.set()
+                            last_move_up_time = now
+                        except queue.Full:
+                            _flight_print(
+                                flight_t0,
+                                "  [!] command_queue full — climb not queued",
+                                flush=True,
+                            )
+                        except Exception as e:
+                            _flight_print(
+                                flight_t0,
+                                f"  [!] queue MOVE_UP (thumbs_up) failed: {e}",
+                                flush=True,
+                            )
 
             if state == "IDLE":
-                if gfilter._confirmed == "fist" and (now - last_start_search_time) >= COMMAND_COOLDOWN:
-                    print("  Start SEARCH: fist (confirmed)", flush=True)
+                if gfilter.confirmed == "fist" and (now - last_start_search_time) >= COMMAND_COOLDOWN:
+                    _flight_print(
+                        flight_t0,
+                        "  Start SEARCH: fist (confirmed)",
+                        flush=True,
+                    )
                     state = "SEARCH"
                     acq_streak = 0
                     loss_streak = 0
@@ -648,12 +1006,24 @@ def main() -> int:
 
             if state == "LAND":
                 try:
-                    _send_yaw_only(tello, 0)
+                    _publish_yaw_rc(rc_lock, latest_yaw_holder, 0)
                 except Exception:
                     pass
-                print("  Landing...")
-                tello.land()
-                airborne = False
+                _flight_print(
+                    flight_t0,
+                    "  Landing (queued for worker)...",
+                    flush=True,
+                )
+                try:
+                    command_queue.put(("LAND", None), timeout=2.0)
+                    land_enqueued = True
+                    airborne = False
+                except Exception as e:
+                    _flight_print(
+                        flight_t0,
+                        f"  [!] queue LAND failed: {e}",
+                        flush=True,
+                    )
                 break
 
             yaw_rc = 0
@@ -665,31 +1035,54 @@ def main() -> int:
                             climb_pending_cm, MAX_CLIMB_AFTER_TAKEOFF_CM
                         )
                         if up_cm > 0:
-                            print(
-                                f"  Climb: move_up({up_cm} cm), then IDLE…",
-                                flush=True,
-                            )
-                            try:
-                                _move_up_with_rc_gap(tello, up_cm)
-                            except Exception as e:
-                                print(f"  [!] move_up failed: {e}", flush=True)
-                        climb_pending_cm = 0
-                        time.sleep(1.2)
-                    state = "IDLE"
-                    acq_streak = 0
-                    loss_streak = 0
-                    print("  State -> IDLE (fist->SEARCH; thumbs_up->up; palm->land)")
+                            if _may_enqueue_discretionary_move(
+                                command_busy, command_queue, move_pending
+                            ):
+                                _flight_print(
+                                    flight_t0,
+                                    f"  Climb: queue MOVE_UP {up_cm} cm, then IDLE…",
+                                    flush=True,
+                                )
+                                try:
+                                    command_queue.put(("MOVE_UP", up_cm, True), timeout=0.5)
+                                    move_pending.set()
+                                    climb_pending_cm = 0
+                                except queue.Full:
+                                    _flight_print(
+                                        flight_t0,
+                                        "  [!] command_queue full — post-takeoff climb lost",
+                                        flush=True,
+                                    )
+                                    climb_pending_cm = 0
+                                except Exception as e:
+                                    _flight_print(
+                                        flight_t0,
+                                        f"  [!] queue MOVE_UP failed: {e}",
+                                        flush=True,
+                                    )
+                                    climb_pending_cm = 0
+                        else:
+                            climb_pending_cm = 0
+                    if climb_pending_cm == 0:
+                        state = "IDLE"
+                        acq_streak = 0
+                        loss_streak = 0
+                        _flight_print(
+                            flight_t0,
+                            "  State -> IDLE (fist->SEARCH; thumbs_up->up; palm->land)",
+                            flush=True,
+                        )
                 else:
-                    _send_yaw_only(tello, 0)
+                    _publish_yaw_rc(rc_lock, latest_yaw_holder, 0)
 
             elif state == "IDLE":
                 yaw_rc = 0
-                _send_yaw_only(tello, 0)
+                _publish_yaw_rc(rc_lock, latest_yaw_holder, 0)
 
             elif state == "SEARCH":
                 yaw_rc = 0
                 if args.search_mode == "cw":
-                    _send_yaw_only(tello, 0)
+                    _publish_yaw_rc(rc_lock, latest_yaw_holder, 0)
                     if now - last_search_cw_time >= args.search_cw_interval:
                         deg = args.search_cw_degrees
                         try:
@@ -698,18 +1091,26 @@ def main() -> int:
                             else:
                                 tello.rotate_counter_clockwise(deg)
                         except Exception as e:
-                            print(f"  [!] SEARCH cw/ccw failed: {e}", flush=True)
+                            _flight_print(
+                                flight_t0,
+                                f"  [!] SEARCH cw/ccw failed: {e}",
+                                flush=True,
+                            )
                         last_search_cw_time = time.time()
                 else:
                     yaw_rc = _clamp_rc(args.search_yaw_rc)
-                    _send_yaw_only(tello, yaw_rc)
+                    _publish_yaw_rc(rc_lock, latest_yaw_holder, yaw_rc)
                 if face_ok:
                     acq_streak += 1
                     if acq_streak >= M_ACQUIRE:
                         state = "FACE_LOCK"
                         acq_streak = 0
                         loss_streak = 0
-                        print("  State -> FACE_LOCK")
+                        _flight_print(
+                            flight_t0,
+                            "  State -> FACE_LOCK",
+                            flush=True,
+                        )
                 else:
                     acq_streak = 0
 
@@ -734,9 +1135,13 @@ def main() -> int:
                         acq_streak = 0
                         loss_streak = 0
                         last_search_cw_time = now - args.search_cw_interval
-                        print("  State -> SEARCH (face loss)")
+                        _flight_print(
+                            flight_t0,
+                            "  State -> SEARCH (face loss)",
+                            flush=True,
+                        )
 
-                _send_yaw_only(tello, yaw_rc)
+                _publish_yaw_rc(rc_lock, latest_yaw_holder, yaw_rc)
 
             last_yaw_rc = yaw_rc
 
@@ -756,6 +1161,11 @@ def main() -> int:
                 f"acq={acq_streak}/{M_ACQUIRE} loss={loss_streak}/{M_LOSS} | "
                 f"f_ok={int(face_ok)} x={face_x_norm:+.2f} | bat={battery}%"
             )
+            hud_streak_ratio = None
+            if last_climb_reset_time is not None and (
+                time.monotonic() - last_climb_reset_time
+            ) < CLIMB_HUD_STREAK_CLEAR_S:
+                hud_streak_ratio = 0.0
             draw_cam_panel(
                 frame_bgr,
                 raw_gesture,
@@ -774,6 +1184,7 @@ def main() -> int:
                 yunet_error=yunet_load_error,
                 trust_line=trust_hud,
                 beh_line=beh_line,
+                hud_streak_ratio=hud_streak_ratio,
             )
             if state == "IDLE":
                 foot = "[Q] land  fist->SEARCH  thumbs->up  palm=LAND"
@@ -794,13 +1205,39 @@ def main() -> int:
             cv2.imshow("Tello Autonomy v1", frame_bgr)
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), ord("Q")):
-                print("  Q pressed — landing.")
+                _flight_print(flight_t0, "  Q pressed — landing.", flush=True)
                 state = "LAND"
 
     except KeyboardInterrupt:
-        print("\n  KeyboardInterrupt — landing if airborne.")
-        state = "LAND"
+        _flight_print(
+            takeoff_monotonic,
+            "\n  KeyboardInterrupt — landing if airborne.",
+            flush=True,
+        )
+        if command_queue is not None and airborne:
+            try:
+                if rc_lock is not None and latest_yaw_holder is not None:
+                    _publish_yaw_rc(rc_lock, latest_yaw_holder, 0)
+            except Exception:
+                pass
+            try:
+                command_queue.put(("LAND", None), timeout=2.0)
+                land_enqueued = True
+                airborne = False
+            except Exception as e:
+                _flight_print(
+                    takeoff_monotonic,
+                    f"  [!] queue LAND after interrupt failed: {e}",
+                    flush=True,
+                )
     finally:
+        if rc_thread is not None:
+            if land_enqueued:
+                rc_thread.join(timeout=120.0)
+            else:
+                if shutdown_rc is not None and not shutdown_rc.is_set():
+                    shutdown_rc.set()
+                rc_thread.join(timeout=3.0)
         try:
             _send_yaw_only(tello, 0)
         except Exception:
@@ -809,7 +1246,11 @@ def main() -> int:
             try:
                 tello.land()
             except Exception as e:
-                print(f"  Land in finally failed: {e}", file=sys.stderr)
+                _flight_print(
+                    takeoff_monotonic,
+                    f"  [!] Emergency land in finally failed: {e}",
+                    file=sys.stderr,
+                )
         try:
             tello.streamoff()
         except Exception:
@@ -820,7 +1261,7 @@ def main() -> int:
             pass
         cv2.destroyAllWindows()
 
-    print("Done.")
+    _flight_print(takeoff_monotonic, "Done.")
     return 0
 
 

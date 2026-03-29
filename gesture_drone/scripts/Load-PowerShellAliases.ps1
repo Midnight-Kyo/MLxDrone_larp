@@ -7,13 +7,30 @@
 # Or load manually for this session only:
 #   . .\Load-PowerShellAliases.ps1
 #
-# Use the same Python you use for this project (activate your Windows venv first, or set MLX_PYTHON).
+# Python selection (first match wins; no need to set env vars if you use the default winvenv path):
+#   1. $env:MLX_PYTHON — explicit python.exe (highest priority)
+#   2. $env:MLX_WIN_VENV_HOME — folder that contains .venv; uses .venv\Scripts\python.exe
+#   3. $env:USERPROFILE\mlx-drone-winvenv\.venv\Scripts\python.exe — common Windows GPU/camera venv
+#   Add this file to $PROFILE (see Install-MLxPowerShellProfile.ps1) so every new PowerShell picks it up.
 
 $script:MLxScripts = $PSScriptRoot
 $script:MLxRepo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 
 function script:Get-MlxPython {
-    if ($env:MLX_PYTHON) { return $env:MLX_PYTHON }
+    if ($env:MLX_PYTHON) {
+        return $env:MLX_PYTHON
+    }
+    if ($env:MLX_WIN_VENV_HOME) {
+        $venvRoot = Join-Path $env:MLX_WIN_VENV_HOME ".venv"
+        $exe = Join-Path $venvRoot "Scripts\python.exe"
+        if (Test-Path -LiteralPath $exe) {
+            return $exe
+        }
+    }
+    $auto = Join-Path $env:USERPROFILE "mlx-drone-winvenv\.venv\Scripts\python.exe"
+    if (Test-Path -LiteralPath $auto) {
+        return $auto
+    }
     return "python"
 }
 
@@ -32,7 +49,7 @@ function global:bridge {
 }
 
 function global:tello {
-    # ValueFromRemainingArguments: reliably forward `tello --enhance-stream` / `tello -E`
+    # ValueFromRemainingArguments: reliably forward `tello --autonomy-preview`, etc.
     # (plain `$args` can fail depending on profile / PS version).
     param(
         [Parameter(ValueFromRemainingArguments = $true)]
@@ -73,14 +90,14 @@ MLxDrone commands (after loading Load-PowerShellAliases.ps1):
   simulate 1
 
   tello              Tello camera HUD only (no ROS)
-  tello --enhance-stream   or   tello -E   Bilateral + unsharp + ENHANCED HUD badge
   tello-realtest     Real Tello: takeoff → hover → you type land (djitellopy, no ROS)
   tello-autonomy     Real Tello v1: SEARCH → FACE_LOCK (yaw) → open palm land (no ROS)
 
 Repo: $($script:MLxRepo)
 
-Set MLX_PYTHON to your venv python.exe if `python` is wrong, e.g.:
+Python: auto-uses ``%USERPROFILE%\mlx-drone-winvenv\.venv`` when that exists; otherwise set:
   `$env:MLX_PYTHON = 'C:\path\to\venv\Scripts\python.exe'
+or ``MLX_WIN_VENV_HOME`` to the parent folder of ``.venv``.
 
 "@
 }

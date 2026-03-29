@@ -1,25 +1,21 @@
 r"""
-Physical Tello — v1 autonomy (no ROS): SEARCH (slow yaw) → FACE_LOCK (face centering) → land on open palm.
+Physical Tello — v1 autonomy (no ROS): **take off** → **IDLE** (zero sticks) until you gesture.
+Confirmed **fist** starts **SEARCH** (slow yaw for a face) → **FACE_LOCK**.
+**Thumbs up → climb** when ``GestureFilter`` promotes ``thumbs_up`` to ``_confirmed`` (same hysteresis as
+other gestures), then one ``move_up(``\ ``--thumbs-up-cm``\ ``)``; **COMMAND_COOLDOWN** between climbs.
+Confirmed **open_palm** **lands**. **Q** / Ctrl+C lands.
 
 - Reuses ``tello_view.init_perception`` (YOLO + YuNet + GestureFilter + classifier).
 - **TrustedHandGate is off** (``perception["tgate"] = None`` after init); **GestureFilter** uses
-  ``AUTONOMY_GESTURE_*`` from ``simulate_drone`` (19 / 25). Default ``tello_view`` / bridge / sim keep
-  TrustedHand + 8 / 12; **``tello_view --autonomy-preview``** matches this stack on the ground (no motors).
-- Reuses ``search_behavior`` face gating and streak constants.
-- SEARCH default: SDK **cw/ccw** steps (in-place rotation; avoids lateral drift from ``rc`` yaw).
-- Optional **--search-mode rc** for continuous stick yaw. FACE_LOCK still uses ``rc`` yaw only on the 4th axis.
+  ``AUTONOMY_GESTURE_*`` from ``simulate_drone`` (19 / 25).
+- SEARCH default: **continuous RC yaw**; optional **--search-mode cw** for SDK rotate steps.
+- After **FACE_LOCK**, if the face is lost long enough, behavior returns to **SEARCH** (not IDLE).
 
-Windows: join TELLO-XXXX Wi‑Fi, clear space, then (with project venv):
+Pre-flight: preview **[T]** → optional climb **(cm)** → console **Enter** to take off.
 
-    python gesture_drone/scripts/tello_real_autonomy_v1.py
+Windows: join TELLO-XXXX Wi‑Fi, clear space, then ``python gesture_drone/scripts/tello_real_autonomy_v1.py``.
 
-Preview CLI flags match ``tello_view.add_preview_arguments`` (see ``--help``); TrustedHand args are ignored
-because the gate is forced off after init. Ctrl+C or ``Q`` attempts zero-RC then ``land()``.
-
-Open palm (GestureFilter **confirmed**) triggers land while in SEARCH or FACE_LOCK only.
-
-Pre-flight: after connect + stream, a **preview** window runs on the ground (same HUD, no RC);
-press **[T]** when satisfied, then **Enter** in the console to take off.
+Preview CLI flags match ``tello_view.add_preview_arguments`` (see ``--help``); TrustedHand args are ignored.
 """
 
 from __future__ import annotations
@@ -48,6 +44,7 @@ from simulate_drone import (
     BboxSmoother,
     COMMAND_COOLDOWN,
     CONFIDENCE_THRESHOLD,
+    GESTURE_TO_COMMAND,
     YUNET_FRAME_STRIDE,
     YUNET_MAX_INFER_SIDE,
     PADDING_RATIO,
@@ -60,8 +57,20 @@ from yunet_face import detect_largest_face
 FACE_HAND_IOU_MAX = 0.22
 
 # Conservative RC yaw magnitude (-100..100). Tune via CLI.
-DEFAULT_SEARCH_YAW_RC = 22
+DEFAULT_SEARCH_YAW_RC = 16
 DEFAULT_LOCK_YAW_MAX_RC = 28
+
+# After takeoff + settle, optional ``move_up`` before IDLE (cm); capped for safety.
+MAX_CLIMB_AFTER_TAKEOFF_CM = 200
+MAX_THUMBS_UP_CM = 200
+
+# Tello SDK: ``move_*`` distance must be 20–500 cm. Below 20 is rejected ("out of range").
+MIN_SDK_MOVE_CM = 20
+MAX_SDK_MOVE_CM = 500
+
+# Pause RC updates before ``move_*`` so the firmware is not in joystick mode.
+RC_GAP_BEFORE_MOVE_UP_S = 0.45
+RC_GAP_AFTER_MOVE_UP_S = 0.12
 
 _stop_requested = False
 
@@ -81,9 +90,68 @@ def _send_yaw_only(tello: Tello, yaw_rc: int) -> None:
     tello.send_rc_control(0, 0, 0, _clamp_rc(yaw_rc))
 
 
+def _sdk_move_dist_cm(dist: int, cap_cm: int) -> int:
+    """Clamp distance for ``move_up`` / ``move_*``. Zero skips; else in [MIN_SDK, cap]."""
+    if dist <= 0:
+        return 0
+    upper = min(cap_cm, MAX_SDK_MOVE_CM)
+    return max(MIN_SDK_MOVE_CM, min(upper, dist))
+
+
+def _move_up_with_rc_gap(tello: Tello, dist_cm: int) -> None:
+    """Do not call ``send_rc_control`` immediately before ``move_up`` — sleep first, then resume RC after."""
+    if dist_cm <= 0:
+        return
+    time.sleep(RC_GAP_BEFORE_MOVE_UP_S)
+    tello.move_up(int(dist_cm))
+    time.sleep(RC_GAP_AFTER_MOVE_UP_S)
+
+
+def _hud_command_label(state: str, cmd_gesture: str) -> str:
+    """Third line in ``draw_cam_panel`` (below gesture)."""
+    if state == "TAKEOFF":
+        return "SETTLE"
+    if cmd_gesture == "thumbs_up":
+        return GESTURE_TO_COMMAND.get("thumbs_up", "MOVE UP")
+    if cmd_gesture == "open_palm":
+        return GESTURE_TO_COMMAND.get("open_palm", "LAND")
+    if state == "IDLE" and cmd_gesture == "fist":
+        return "START SCAN"
+    if state == "SEARCH":
+        return "SCANNING"
+    if state == "FACE_LOCK":
+        return "FACE LOCK"
+    if state == "IDLE":
+        return "HOVER"
+    return state
+
+
+def _prompt_climb_after_takeoff_cm(default: int) -> int:
+    """Console prompt after preview [T]. Empty line keeps ``default``."""
+    print(
+        "\n--- Climb after takeoff (optional, before IDLE) ---\n"
+        "  Enter centimeters for one ``move_up`` after takeoff (head height), or 0 to skip.\n"
+        f"  Tello requires {MIN_SDK_MOVE_CM}-{MAX_SDK_MOVE_CM} cm; values below {MIN_SDK_MOVE_CM} "
+        f"are raised to {MIN_SDK_MOVE_CM}.\n"
+        f"  Flag default (--climb-after-takeoff-cm): {default}"
+    )
+    raw = input(f"  Climb cm [default {default}]: ").strip()
+    if not raw:
+        v = default
+    else:
+        try:
+            v = int(raw, 10)
+        except ValueError:
+            print(f"  Invalid number — using default {default}.")
+            v = default
+    return max(0, min(MAX_CLIMB_AFTER_TAKEOFF_CM, v))
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Tello v1: takeoff → SEARCH (yaw) → FACE_LOCK → land on open palm (no ROS)."
+        description=(
+            "Tello v1: takeoff -> IDLE; fist=SEARCH; thumbs_up=move_up; palm=land. No ROS."
+        )
     )
     tello_view.add_preview_arguments(p)
     p.add_argument(
@@ -96,15 +164,15 @@ def parse_args() -> argparse.Namespace:
         "--settle-s",
         type=float,
         default=2.5,
-        help="Seconds after takeoff to send zero RC before SEARCH (default 2.5).",
+        help="Seconds after takeoff with zero yaw RC before climb/SEARCH (default 2.5).",
     )
     p.add_argument(
         "--search-mode",
-        choices=("cw", "rc"),
-        default="cw",
+        choices=("rc", "cw"),
+        default="rc",
         help=(
-            "SEARCH spin: 'cw' = discrete rotate_clockwise/ccw (in-place, default). "
-            "'rc' = continuous send_rc_control yaw only (can drift sideways)."
+            "SEARCH spin: 'rc' = continuous yaw via send_rc_control (default, smooth). "
+            "'cw' = discrete rotate_clockwise/ccw SDK commands (pauses feed each step)."
         ),
     )
     p.add_argument(
@@ -134,11 +202,36 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_LOCK_YAW_MAX_RC,
         help="FACE_LOCK: max |yaw| RC when correcting (default 28).",
     )
+    p.add_argument(
+        "--climb-after-takeoff-cm",
+        type=int,
+        default=0,
+        help=(
+            "After takeoff + settle, move_up this many cm before IDLE (0 = skip). "
+            "Console prompt after [T] can override."
+        ),
+    )
+    p.add_argument(
+        "--thumbs-up-cm",
+        type=int,
+        default=20,
+        help=(
+            "After confirmed thumbs_up: one move_up by this many cm (default 20; "
+            f"Tello requires {MIN_SDK_MOVE_CM}..{MAX_SDK_MOVE_CM} cm; "
+            f"clamped {MIN_SDK_MOVE_CM}..{MAX_THUMBS_UP_CM})."
+        ),
+    )
     args = p.parse_args()
     args.search_yaw_rc = max(-100, min(100, args.search_yaw_rc))
     args.lock_yaw_max_rc = max(1, min(100, args.lock_yaw_max_rc))
     args.search_cw_degrees = max(1, min(360, args.search_cw_degrees))
     args.search_cw_interval = max(0.15, float(args.search_cw_interval))
+    args.climb_after_takeoff_cm = max(
+        0, min(MAX_CLIMB_AFTER_TAKEOFF_CM, int(args.climb_after_takeoff_cm))
+    )
+    args.thumbs_up_cm = max(
+        MIN_SDK_MOVE_CM, min(MAX_THUMBS_UP_CM, int(args.thumbs_up_cm))
+    )
     return args
 
 
@@ -179,7 +272,7 @@ def run_pre_takeoff_preview(
     temp = initial_tmp
 
     print("\n--- Pre-flight preview (drone on ground, no motor commands) ---")
-    print("  In the video window: [T] = feed OK → then press Enter HERE to take off")
+    print("  In the video window: [T] = feed OK -> console for climb + takeoff")
     print("                       [Q] = quit without flying")
     print("  Ctrl+C also aborts preview.")
 
@@ -267,9 +360,9 @@ def run_pre_takeoff_preview(
 
             trust_hud = None
             beh_line = (
-                "PREVIEW | [T] ready → Enter in console to take off | "
+                "PREVIEW | [T] ready -> Enter in console to take off | "
                 f"f_ok={int(face_ok)} x={face_x_norm:+.2f} | "
-                f"classifier≥{CONFIDENCE_THRESHOLD:.0%} | bat={battery}%"
+                f"classifier>={CONFIDENCE_THRESHOLD:.0%} | bat={battery}%"
             )
             draw_cam_panel(
                 frame_bgr,
@@ -292,7 +385,7 @@ def run_pre_takeoff_preview(
             )
             cv2.putText(
                 frame_bgr,
-                "[T] next step   [Q] quit   (then Enter in console for takeoff)",
+                "[T] console: climb cm + takeoff   [Q] quit",
                 (12, fh - 14),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.45,
@@ -332,9 +425,12 @@ def main() -> int:
         return 1
 
     print("\n=== Tello real autonomy v1 (yaw-only) ===")
-    print("Join TELLO Wi‑Fi, clear volume around drone, keep hands clear during takeoff.")
-    print("Flow: Connect → live preview (check camera + model) → [T] → Enter to take off → fly.")
-    print("In flight: OPEN PALM (confirmed) to land, or Q / Ctrl+C.")
+    print("Join TELLO Wi-Fi, clear volume around drone, keep hands clear during takeoff.")
+    print(
+        "Flow: preview [T] -> climb -> takeoff -> IDLE -> fist=SEARCH; thumbs_up=move_up; palm=land "
+        "(thumbs/FACE_LOCK too)."
+    )
+    print("In flight: OPEN PALM (confirmed) to land; Q / Ctrl+C lands.")
     input("Press Enter to CONNECT (no takeoff yet)...")
 
     tello = Tello()
@@ -381,6 +477,8 @@ def main() -> int:
     loss_streak = 0
     settle_deadline = 0.0
     last_land_fire = 0.0
+    last_start_search_time = 0.0
+    last_move_up_time = 0.0
     telem_timer = time.time()
     prev_time = time.time()
     fps = 0.0
@@ -406,9 +504,13 @@ def main() -> int:
         return 0
 
     cv2.destroyAllWindows()
+    climb_pending_cm = _prompt_climb_after_takeoff_cm(args.climb_after_takeoff_cm)
+    if climb_pending_cm > 0:
+        print(f"  Will climb {climb_pending_cm} cm after takeoff settle, then IDLE (zero sticks).")
+
     print(
-        "\nPreview closed. Takeoff is next: put the window aside and use this console.\n"
-        "Press Enter to TAKEOFF — then autonomy runs (SEARCH → FACE_LOCK)..."
+        "\nPreview closed. Takeoff is next: put the video window aside and use this console.\n"
+        "Press Enter to TAKEOFF — **IDLE** until **fist** starts SEARCH; **thumbs_up** climbs."
     )
     input()
 
@@ -417,9 +519,12 @@ def main() -> int:
         airborne = True
         settle_deadline = time.time() + max(0.0, args.settle_s)
         state = "TAKEOFF"
-        print(f"  Takeoff issued — settling {args.settle_s:.1f}s with zero yaw RC...")
         print(
-            f"  SEARCH mode: {args.search_mode}"
+            f"  Takeoff issued — settling {args.settle_s:.1f}s with zero RC, then **IDLE** "
+            f"(fist->SEARCH, thumbs_up->move_up {args.thumbs_up_cm}cm)."
+        )
+        print(
+            f"  When SEARCH runs: {args.search_mode}"
             + (
                 f" ({args.search_cw_degrees}° / {args.search_cw_interval:.2f}s, sign={'cw' if args.search_yaw_rc >= 0 else 'ccw'})"
                 if args.search_mode == "cw"
@@ -505,18 +610,41 @@ def main() -> int:
                 gfilter.update(feed, confidence if behavior_allow else 0.0) or "No hand"
             )
             cmd_gesture = gesture
-            # v1: no two_fingers follow latch — only open_palm lands (see below).
 
             face_ok, face_x_norm = face_ok_and_x_norm(face_fb, face_score, fw, fh)
 
             if _stop_requested:
                 state = "LAND"
 
-            if state in ("SEARCH", "FACE_LOCK"):
+            if state in ("IDLE", "SEARCH", "FACE_LOCK"):
                 if gfilter._confirmed == "open_palm" and (now - last_land_fire) >= COMMAND_COOLDOWN:
                     print("  Land trigger: open_palm (confirmed)")
                     state = "LAND"
                     last_land_fire = now
+
+            if state in ("IDLE", "SEARCH", "FACE_LOCK", "TAKEOFF"):
+                if gfilter._confirmed == "thumbs_up" and (
+                    now - last_move_up_time
+                ) >= COMMAND_COOLDOWN:
+                    up_cm = _sdk_move_dist_cm(args.thumbs_up_cm, MAX_THUMBS_UP_CM)
+                    print(
+                        f"  Climb trigger: thumbs_up (confirmed) -> move_up({up_cm} cm)",
+                        flush=True,
+                    )
+                    try:
+                        _move_up_with_rc_gap(tello, up_cm)
+                    except Exception as e:
+                        print(f"  [!] move_up (thumbs_up) failed: {e}", flush=True)
+                    last_move_up_time = now
+
+            if state == "IDLE":
+                if gfilter._confirmed == "fist" and (now - last_start_search_time) >= COMMAND_COOLDOWN:
+                    print("  Start SEARCH: fist (confirmed)", flush=True)
+                    state = "SEARCH"
+                    acq_streak = 0
+                    loss_streak = 0
+                    last_search_cw_time = now - args.search_cw_interval
+                    last_start_search_time = now
 
             if state == "LAND":
                 try:
@@ -531,13 +659,32 @@ def main() -> int:
             yaw_rc = 0
             if state == "TAKEOFF":
                 yaw_rc = 0
-                _send_yaw_only(tello, 0)
                 if now >= settle_deadline:
-                    state = "SEARCH"
+                    if climb_pending_cm > 0:
+                        up_cm = _sdk_move_dist_cm(
+                            climb_pending_cm, MAX_CLIMB_AFTER_TAKEOFF_CM
+                        )
+                        if up_cm > 0:
+                            print(
+                                f"  Climb: move_up({up_cm} cm), then IDLE…",
+                                flush=True,
+                            )
+                            try:
+                                _move_up_with_rc_gap(tello, up_cm)
+                            except Exception as e:
+                                print(f"  [!] move_up failed: {e}", flush=True)
+                        climb_pending_cm = 0
+                        time.sleep(1.2)
+                    state = "IDLE"
                     acq_streak = 0
                     loss_streak = 0
-                    last_search_cw_time = now - args.search_cw_interval
-                    print("  State → SEARCH (slow yaw)")
+                    print("  State -> IDLE (fist->SEARCH; thumbs_up->up; palm->land)")
+                else:
+                    _send_yaw_only(tello, 0)
+
+            elif state == "IDLE":
+                yaw_rc = 0
+                _send_yaw_only(tello, 0)
 
             elif state == "SEARCH":
                 yaw_rc = 0
@@ -562,7 +709,7 @@ def main() -> int:
                         state = "FACE_LOCK"
                         acq_streak = 0
                         loss_streak = 0
-                        print("  State → FACE_LOCK")
+                        print("  State -> FACE_LOCK")
                 else:
                     acq_streak = 0
 
@@ -587,21 +734,25 @@ def main() -> int:
                         acq_streak = 0
                         loss_streak = 0
                         last_search_cw_time = now - args.search_cw_interval
-                        print("  State → SEARCH (face loss)")
+                        print("  State -> SEARCH (face loss)")
 
                 _send_yaw_only(tello, yaw_rc)
 
             last_yaw_rc = yaw_rc
 
             trust_hud = None
-            if state == "SEARCH" and args.search_mode == "cw":
+            if state == "IDLE":
+                search_note = (
+                    f"fist->SEARCH thumbs->{args.thumbs_up_cm}cm palm->LAND (confirmed)"
+                )
+            elif state == "SEARCH" and args.search_mode == "cw":
                 search_note = f"SEARCH=cw {args.search_cw_degrees}deg/{args.search_cw_interval:.2f}s"
             elif state == "SEARCH":
                 search_note = f"SEARCH=rc yaw={last_yaw_rc}"
             else:
                 search_note = f"yaw_rc={last_yaw_rc}"
             beh_line = (
-                f"AUTO state={state} {search_note} | "
+                f"{state}: {search_note} | "
                 f"acq={acq_streak}/{M_ACQUIRE} loss={loss_streak}/{M_LOSS} | "
                 f"f_ok={int(face_ok)} x={face_x_norm:+.2f} | bat={battery}%"
             )
@@ -611,7 +762,7 @@ def main() -> int:
                 cmd_gesture,
                 confidence,
                 bbox,
-                "IDLE",
+                _hud_command_label(state, cmd_gesture),
                 fps,
                 gfilter,
                 source_label="TELLO autonomy v1",
@@ -624,9 +775,15 @@ def main() -> int:
                 trust_line=trust_hud,
                 beh_line=beh_line,
             )
+            if state == "IDLE":
+                foot = "[Q] land  fist->SEARCH  thumbs->up  palm=LAND"
+            elif state in ("SEARCH", "FACE_LOCK"):
+                foot = f"[Q] land  thumbs->up {args.thumbs_up_cm}cm  palm=LAND"
+            else:
+                foot = "[Q] land   palm (confirmed)=land"
             cv2.putText(
                 frame_bgr,
-                "[Q] land   Open palm (confirmed) to land",
+                foot,
                 (12, fh - 14),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.45,

@@ -1,14 +1,15 @@
 r"""
 Physical Tello — v1 autonomy (no ROS): **take off** → **IDLE** (zero sticks) until you gesture.
-Confirmed **fist** starts **SEARCH** (slow yaw for a face) → **FACE_LOCK**.
+Confirmed **fist** starts **SEARCH** (cold / recovery RC yaw for a face) → **SETTLE** (zero yaw) → **ACQ** → **FACE_LOCK**.
 **Thumbs up → climb** when ``GestureFilter`` confirms ``thumbs_up``, then one ``move_up(``\ ``--thumbs-up-cm``\ ``)``;
-**COMMAND_COOLDOWN** and queue/discretionary gates throttle climbs.
+**Peace sign (two_fingers) → forward** — one ``move_forward`` by **20 cm** (SDK minimum).
+**COMMAND_COOLDOWN** and queue/discretionary gates throttle each motion type.
 Confirmed **open_palm** **lands**. **Q** / Ctrl+C lands.
 
 - Reuses ``tello_view.init_perception`` (YOLO + YuNet + GestureFilter + classifier).
 - **TrustedHandGate is off** (``perception["tgate"] = None`` after init); **GestureFilter** is
   time-based (``gesture_filter.py``: default **2.0 s** lock, **2.5 s** unlock).
-- SEARCH default: **continuous RC yaw**; optional **--search-mode cw** for SDK rotate steps.
+- SEARCH: **continuous RC yaw** (cold vs recovery after face loss); optional **--search-mode cw** for SDK rotate steps.
 - After **FACE_LOCK**, if the face is lost long enough, behavior returns to **SEARCH** (not IDLE).
 
 Pre-flight: preview **[T]** → optional climb **(cm)** → console **Enter** to take off.
@@ -21,6 +22,7 @@ Preview CLI flags match ``tello_view.add_preview_arguments`` (see ``--help``); T
 from __future__ import annotations
 
 import argparse
+import logging
 import queue
 import signal
 import sys
@@ -34,10 +36,7 @@ from djitellopy import Tello
 from hand_detection import detect_hand
 from search_behavior import (
     EPS_X,
-    M_ACQUIRE,
-    M_LOSS,
     MAX_ANG_LOCK,
-    KP_LOCK,
     face_ok_and_x_norm,
 )
 from gesture_filter import (
@@ -51,7 +50,6 @@ from simulate_drone import (
     COMMAND_COOLDOWN,
     CONFIDENCE_THRESHOLD,
     GESTURE_TO_COMMAND,
-    YUNET_FRAME_STRIDE,
     YUNET_MAX_INFER_SIDE,
     PADDING_RATIO,
     classify_hand,
@@ -62,12 +60,31 @@ from yunet_face import detect_largest_face
 FACE_HAND_IOU_MAX = 0.22
 
 # Conservative RC yaw magnitude (-100..100). Tune via CLI.
-DEFAULT_SEARCH_YAW_RC = 16
+DEFAULT_SEARCH_YAW_RC = 40
+DEFAULT_SEARCH_YAW_RC_RECOVERY = 28
 DEFAULT_LOCK_YAW_MAX_RC = 28
 
 # After takeoff + settle, optional ``move_up`` before IDLE (cm); capped for safety.
 MAX_CLIMB_AFTER_TAKEOFF_CM = 200
 MAX_THUMBS_UP_CM = 200
+# Autonomous forward segment (SDK minimum 20 cm).
+MOVE_FORWARD_CM = 50
+
+# Face lock timing (real autonomy); ``search_behavior.M_ACQUIRE`` / ``M_LOSS`` stay for bridge/sim.
+T_FACE_SETTLE_S = 0.2
+T_FACE_ACQUIRE_S = 0.2
+T_FACE_LOSS_S = 1.5
+# YuNet scheduling in this script only (do not change ``simulate_drone.YUNET_FRAME_STRIDE``).
+AUTONOMY_YUNET_FRAME_STRIDE = 2
+
+# FACE_LOCK yaw PD (real autonomy only; ``search_behavior.KP_LOCK`` unchanged for sim/bridge).
+# face_x_norm is not EMA-smoothed (raw ``face_ok_and_x_norm`` only; ``BboxSmoother`` is hand bbox).
+KP_LOCK_FACE = 0.245
+KD_LOCK_FACE = 0.0525
+# Min continuous face_ok in FACE_LOCK before a new "Face lost" console line may be emitted.
+FACE_LOCK_LOSS_LOG_ARM_DWELL_S = 0.15
+# Ignore derivative when frame spacing is tiny (avoids d_error spikes).
+_FACE_LOCK_D_DELTA_T_MIN = 1e-4
 
 # Tello SDK: ``move_*`` distance must be 20–500 cm. Below 20 is rejected ("out of range").
 MIN_SDK_MOVE_CM = 20
@@ -84,6 +101,26 @@ RC_GAP_AFTER_MOVE_UP_S = 0.12
 CLIMB_HUD_STREAK_CLEAR_S = 0.3
 
 _stop_requested = False
+
+
+def _hand_center_in_gesture_zone(
+    bbox: tuple[Any, ...] | None,
+    frame_h: int,
+    top_frac: float,
+) -> bool:
+    """True if hand bbox vertical center is in the top ``top_frac`` of the frame (y down)."""
+    if bbox is None or top_frac >= 1.0:
+        return True
+    _x1, y1, _x2, y2 = (float(v) for v in bbox[:4])
+    cy = 0.5 * (y1 + y2)
+    return cy < top_frac * float(frame_h)
+
+
+def _gesture_zone_line_y(frame_h: int, top_frac: float) -> int | None:
+    if top_frac >= 1.0:
+        return None
+    y = int(round(top_frac * float(frame_h)))
+    return max(0, min(frame_h - 1, y))
 
 
 class SafeTello(Tello):
@@ -117,6 +154,22 @@ def _on_sigint(signum, frame) -> None:  # noqa: ARG001
 
 def _clamp_rc(v: int) -> int:
     return max(-100, min(100, int(v)))
+
+
+def _search_rc_spin_yaw_and_kind(
+    args: argparse.Namespace,
+    search_direction_from_face: bool,
+    last_face_x_norm: float | None,
+) -> tuple[int, str]:
+    """RC-mode SEARCH spin: (yaw_rc, 'cold' | 'recovery')."""
+    cold = _clamp_rc(args.search_yaw_rc)
+    rec = _clamp_rc(args.search_yaw_rc_recovery)
+    if search_direction_from_face and last_face_x_norm is not None:
+        if abs(last_face_x_norm) > EPS_X:
+            mag = abs(rec) or 1
+            sign = 1 if last_face_x_norm > 0 else -1
+            return _clamp_rc(sign * mag), "recovery"
+    return cold, "cold"
 
 
 def _send_yaw_only(tello: Tello, yaw_rc: int) -> None:
@@ -159,7 +212,7 @@ def _rc_worker_loop(
     result_q: queue.Queue,
     takeoff_mono: float,
 ) -> None:
-    """Thread 2: dispatch command_queue (MOVE_UP, LAND); ~25 Hz RC when not busy; yaw 0 = no send.
+    """Thread 2: dispatch command_queue (MOVE_UP, MOVE_FORWARD, LAND); ~25 Hz RC when not busy; yaw 0 = no send.
 
     When yaw is 0 (IDLE hover), no RC was being sent and the firmware auto-lands after ~15s without
     stick traffic. A ``send_rc_control(0,0,0,0)`` keepalive runs if no RC for 10s while not busy.
@@ -176,98 +229,154 @@ def _rc_worker_loop(
             pass
 
         if cmd is not None:
-            if cmd[0] == "MOVE_UP":
-                command_busy.set()
-                while True:
-                    dist = int(cmd[1])
-                    post_takeoff_settle = len(cmd) >= 3 and bool(cmd[2])
-                    ok = True
-                    try:
-                        _move_up_with_rc_gap(
-                            tello,
-                            dist,
-                            after_keepalive_rc=last_rc_was_keepalive,
-                            post_takeoff_settle=post_takeoff_settle,
-                        )
-                    except Exception as e:
-                        if _is_motor_stop_error(e):
-                            command_busy.clear()
+            while cmd is not None:
+                if cmd[0] == "MOVE_UP":
+                    command_busy.set()
+                    while True:
+                        dist = int(cmd[1])
+                        post_takeoff_settle = len(cmd) >= 3 and bool(cmd[2])
+                        ok = True
+                        try:
+                            _move_up_with_rc_gap(
+                                tello,
+                                dist,
+                                after_keepalive_rc=last_rc_was_keepalive,
+                                post_takeoff_settle=post_takeoff_settle,
+                            )
+                        except Exception as e:
+                            if _is_motor_stop_error(e):
+                                command_busy.clear()
+                                _worker_blocking_print(
+                                    takeoff_mono,
+                                    f"  [!] [worker] Motor stop (firmware safety): {e}",
+                                )
+                                try:
+                                    result_q.put(("MOTOR_STOP", None), timeout=2.0)
+                                except queue.Full:
+                                    pass
+                                shutdown_ev.set()
+                                return
                             _worker_blocking_print(
                                 takeoff_mono,
-                                f"  [!] [worker] Motor stop (firmware safety): {e}",
+                                f"  [!] [worker] move_up failed: {e}",
                             )
+                            ok = False
+                        finally:
+                            last_rc_was_keepalive = False
+                        try:
+                            result_q.put(("MOVE_UP_DONE", ok), timeout=2.0)
+                        except queue.Full:
+                            _worker_blocking_print(
+                                takeoff_mono,
+                                "  [!] [worker] result_queue full (MOVE_UP_DONE)",
+                            )
+                        try:
+                            nxt = command_q.get_nowait()
+                        except queue.Empty:
+                            command_busy.clear()
+                            cmd = None
+                            break
+                        if nxt[0] == "MOVE_UP":
+                            cmd = nxt
+                            continue
+                        command_busy.clear()
+                        cmd = nxt
+                        break
+
+                elif cmd[0] == "MOVE_FORWARD":
+                    command_busy.set()
+                    while True:
+                        dist = int(cmd[1])
+                        ok = True
+                        try:
+                            _move_forward_with_rc_gap(
+                                tello,
+                                dist,
+                                after_keepalive_rc=last_rc_was_keepalive,
+                            )
+                        except Exception as e:
+                            if _is_motor_stop_error(e):
+                                command_busy.clear()
+                                _worker_blocking_print(
+                                    takeoff_mono,
+                                    f"  [!] [worker] Motor stop (firmware safety): {e}",
+                                )
+                                try:
+                                    result_q.put(("MOTOR_STOP", None), timeout=2.0)
+                                except queue.Full:
+                                    pass
+                                shutdown_ev.set()
+                                return
+                            _worker_blocking_print(
+                                takeoff_mono,
+                                f"  [!] [worker] move_forward failed: {e}",
+                            )
+                            ok = False
+                        finally:
+                            last_rc_was_keepalive = False
+                        try:
+                            result_q.put(("MOVE_FORWARD_DONE", ok), timeout=2.0)
+                        except queue.Full:
+                            _worker_blocking_print(
+                                takeoff_mono,
+                                "  [!] [worker] result_queue full (MOVE_FORWARD_DONE)",
+                            )
+                        try:
+                            nxt = command_q.get_nowait()
+                        except queue.Empty:
+                            command_busy.clear()
+                            cmd = None
+                            break
+                        if nxt[0] == "MOVE_FORWARD":
+                            cmd = nxt
+                            continue
+                        command_busy.clear()
+                        cmd = nxt
+                        break
+
+                elif cmd[0] == "LAND":
+                    while True:
+                        try:
+                            command_q.get_nowait()
+                        except queue.Empty:
+                            break
+                    command_busy.set()
+                    ok_land = True
+                    try:
+                        tello.land()
+                    except Exception as e:
+                        if _is_motor_stop_error(e):
+                            _worker_blocking_print(
+                                takeoff_mono,
+                                f"  [!] [worker] Motor stop (during land): {e}",
+                            )
+                            ok_land = False
                             try:
                                 result_q.put(("MOTOR_STOP", None), timeout=2.0)
                             except queue.Full:
                                 pass
+                            command_busy.clear()
                             shutdown_ev.set()
                             return
                         _worker_blocking_print(
                             takeoff_mono,
-                            f"  [!] [worker] move_up failed: {e}",
+                            f"  [!] [worker] land failed: {e}",
                         )
-                        ok = False
-                    finally:
-                        last_rc_was_keepalive = False
+                        ok_land = False
+                    command_busy.clear()
                     try:
-                        result_q.put(("MOVE_UP_DONE", ok), timeout=2.0)
+                        result_q.put(("LAND_DONE", ok_land), timeout=2.0)
                     except queue.Full:
                         _worker_blocking_print(
                             takeoff_mono,
-                            "  [!] [worker] result_queue full (MOVE_UP_DONE)",
+                            "  [!] [worker] result_queue full (LAND_DONE)",
                         )
-                    try:
-                        nxt = command_q.get_nowait()
-                    except queue.Empty:
-                        command_busy.clear()
-                        cmd = None
-                        break
-                    if nxt[0] == "MOVE_UP":
-                        cmd = nxt
-                        continue
-                    command_busy.clear()
-                    cmd = nxt
-                    break
+                    shutdown_ev.set()
+                    return
 
-            if cmd is not None and cmd[0] == "LAND":
-                while True:
-                    try:
-                        command_q.get_nowait()
-                    except queue.Empty:
-                        break
-                command_busy.set()
-                ok_land = True
-                try:
-                    tello.land()
-                except Exception as e:
-                    if _is_motor_stop_error(e):
-                        _worker_blocking_print(
-                            takeoff_mono,
-                            f"  [!] [worker] Motor stop (during land): {e}",
-                        )
-                        ok_land = False
-                        try:
-                            result_q.put(("MOTOR_STOP", None), timeout=2.0)
-                        except queue.Full:
-                            pass
-                        command_busy.clear()
-                        shutdown_ev.set()
-                        return
-                    _worker_blocking_print(
-                        takeoff_mono,
-                        f"  [!] [worker] land failed: {e}",
-                    )
-                    ok_land = False
-                command_busy.clear()
-                try:
-                    result_q.put(("LAND_DONE", ok_land), timeout=2.0)
-                except queue.Full:
-                    _worker_blocking_print(
-                        takeoff_mono,
-                        "  [!] [worker] result_queue full (LAND_DONE)",
-                    )
-                shutdown_ev.set()
-                return
+                else:
+                    command_busy.clear()
+                    cmd = None
 
             elapsed = time.time() - t0
             rem = period_s - elapsed
@@ -330,7 +439,7 @@ def _may_enqueue_discretionary_move(
     command_q: queue.Queue,
     move_pending: threading.Event,
 ) -> bool:
-    """Thread 1 may ``put`` a non-LAND command only when the worker is idle, queue empty, and no MOVE_UP in flight."""
+    """Thread 1 may ``put`` a non-LAND command only when idle, queue empty, and no MOVE_UP/MOVE_FORWARD in flight (``move_pending``)."""
     return (
         not command_busy.is_set()
         and command_q.qsize() == 0
@@ -359,12 +468,31 @@ def _move_up_with_rc_gap(
     time.sleep(RC_GAP_AFTER_MOVE_UP_S)
 
 
+def _move_forward_with_rc_gap(
+    tello: Tello,
+    dist_cm: int,
+    *,
+    after_keepalive_rc: bool = False,
+) -> None:
+    """Same RC gaps as ``_move_up_with_rc_gap`` (no post-takeoff settle path)."""
+    if dist_cm <= 0:
+        return
+    if after_keepalive_rc:
+        time.sleep(RC_GAP_BEFORE_MOVE_UP_AFTER_KEEPALIVE_S)
+    else:
+        time.sleep(RC_GAP_BEFORE_MOVE_UP_S)
+    tello.move_forward(int(dist_cm))
+    time.sleep(RC_GAP_AFTER_MOVE_UP_S)
+
+
 def _hud_command_label(state: str, cmd_gesture: str) -> str:
     """Third line in ``draw_cam_panel`` (below gesture)."""
     if state == "TAKEOFF":
         return "SETTLE"
     if cmd_gesture == "thumbs_up":
         return GESTURE_TO_COMMAND.get("thumbs_up", "MOVE UP")
+    if cmd_gesture == "two_fingers":
+        return "MOVE FWD"
     if cmd_gesture == "open_palm":
         return GESTURE_TO_COMMAND.get("open_palm", "LAND")
     if state == "IDLE" and cmd_gesture == "fist":
@@ -383,6 +511,8 @@ def _prompt_climb_after_takeoff_cm(default: int) -> int:
     print(
         "\n--- Climb after takeoff (optional, before IDLE) ---\n"
         "  Enter centimeters for one ``move_up`` after takeoff (head height), or 0 to skip.\n"
+        "  If you will use SEARCH (fist after IDLE), keep this climb **50 cm or less** when possible — "
+        "extra height reduces ceiling clearance margin while the drone yaws during search.\n"
         f"  Tello requires {MIN_SDK_MOVE_CM}-{MAX_SDK_MOVE_CM} cm; values below {MIN_SDK_MOVE_CM} "
         f"are raised to {MIN_SDK_MOVE_CM}.\n"
         f"  Flag default (--climb-after-takeoff-cm): {default}"
@@ -402,7 +532,7 @@ def _prompt_climb_after_takeoff_cm(default: int) -> int:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "Tello v1: takeoff -> IDLE; fist=SEARCH; thumbs_up=move_up; palm=land. No ROS."
+            "Tello v1: takeoff -> IDLE; fist=SEARCH; thumbs_up=move_up; two_fingers=move_forward; palm=land. No ROS."
         )
     )
     tello_view.add_preview_arguments(p)
@@ -444,8 +574,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_SEARCH_YAW_RC,
         help=(
-            f"SEARCH rc-mode only: yaw stick -100..100 (default {DEFAULT_SEARCH_YAW_RC}). "
-            "Sign = direction. For cw-mode, sign chooses cw vs ccw only."
+            f"SEARCH rc-mode cold spin (no directional hint): yaw -100..100 "
+            f"(default {DEFAULT_SEARCH_YAW_RC}). Sign = direction. "
+            "For cw-mode, sign chooses cw vs ccw only."
+        ),
+    )
+    p.add_argument(
+        "--search-yaw-rc-recovery",
+        type=int,
+        default=DEFAULT_SEARCH_YAW_RC_RECOVERY,
+        help=(
+            "SEARCH rc-mode magnitude after face loss when rotating toward last_face_x_norm "
+            f"(default {DEFAULT_SEARCH_YAW_RC_RECOVERY}). Clamped -100..100; sign comes from tracker."
         ),
     )
     p.add_argument(
@@ -473,8 +613,26 @@ def parse_args() -> argparse.Namespace:
             f"clamped {MIN_SDK_MOVE_CM}..{MAX_THUMBS_UP_CM})."
         ),
     )
+    p.add_argument(
+        "--test-yaw",
+        action="store_true",
+        help=(
+            "Bench only: connect (no takeoff, no video, no ML). Send rc 0 0 0 15 for 2 s, "
+            "then rc 0 0 0 0, disconnect. Use to confirm physical sign of positive yaw_rc."
+        ),
+    )
+    p.add_argument(
+        "--gesture-zone-top-frac",
+        type=float,
+        default=0.6,
+        help=(
+            "Hand bbox center Y must be in the top fraction of frame height for GestureFilter "
+            "(default 0.6 = top 60 percent). 1.0 disables vertical gating."
+        ),
+    )
     args = p.parse_args()
     args.search_yaw_rc = max(-100, min(100, args.search_yaw_rc))
+    args.search_yaw_rc_recovery = max(-100, min(100, args.search_yaw_rc_recovery))
     args.lock_yaw_max_rc = max(1, min(100, args.lock_yaw_max_rc))
     args.search_cw_degrees = max(1, min(360, args.search_cw_degrees))
     args.search_cw_interval = max(0.15, float(args.search_cw_interval))
@@ -483,6 +641,9 @@ def parse_args() -> argparse.Namespace:
     )
     args.thumbs_up_cm = max(
         MIN_SDK_MOVE_CM, min(MAX_THUMBS_UP_CM, int(args.thumbs_up_cm))
+    )
+    args.gesture_zone_top_frac = max(
+        0.05, min(1.0, float(args.gesture_zone_top_frac))
     )
     return args
 
@@ -561,7 +722,10 @@ def run_pre_takeoff_preview(
             face_score = 0.0
             if face_detector is not None:
                 yunet_frame_i += 1
-                if yunet_frame_i % YUNET_FRAME_STRIDE == 0 or cached_face_pack is None:
+                if (
+                    yunet_frame_i % AUTONOMY_YUNET_FRAME_STRIDE == 0
+                    or cached_face_pack is None
+                ):
                     fb, sc = detect_largest_face(
                         face_detector,
                         frame_bgr,
@@ -584,6 +748,10 @@ def run_pre_takeoff_preview(
             frame_diag["trust_phase"] = "gate_off"
 
             behavior_allow = bool(frame_diag.get("behavior_allow", hand_crop is not None))
+            hand_zone_ok = _hand_center_in_gesture_zone(
+                bbox, fh, args.gesture_zone_top_frac
+            )
+            gesture_for_filter = behavior_allow and hand_zone_ok
 
             raw_gesture = "No hand"
             confidence = 0.0
@@ -597,25 +765,40 @@ def run_pre_takeoff_preview(
             feed = (
                 raw_gesture
                 if (
-                    behavior_allow
+                    gesture_for_filter
                     and hand_crop is not None
                     and confidence >= CONFIDENCE_THRESHOLD
                 )
                 else None
             )
             gesture = (
-                gfilter.update(feed, confidence if behavior_allow else 0.0) or "No hand"
+                gfilter.update(feed, confidence if gesture_for_filter else 0.0) or "No hand"
             )
             cmd_gesture = gesture
 
             face_ok, face_x_norm = face_ok_and_x_norm(face_fb, face_score, fw, fh)
 
             trust_hud = None
+            gz_note = (
+                "gest off"
+                if args.gesture_zone_top_frac >= 1.0
+                else (
+                    "hand low (no gesture)"
+                    if bbox is not None and hand_crop is not None and not hand_zone_ok
+                    else f"gest zone top {args.gesture_zone_top_frac:.0%}"
+                )
+            )
             beh_line = (
                 "PREVIEW | [T] ready -> Enter in console to take off | "
                 f"f_ok={int(face_ok)} x={face_x_norm:+.2f} | "
-                f"classifier>={CONFIDENCE_THRESHOLD:.0%} | bat={battery}%"
+                f"classifier>={CONFIDENCE_THRESHOLD:.0%} | {gz_note} | bat={battery}%"
             )
+            hand_bbox_color = (
+                (96, 96, 96)
+                if bbox is not None and hand_crop is not None and not hand_zone_ok
+                else None
+            )
+            zone_line_y = _gesture_zone_line_y(fh, args.gesture_zone_top_frac)
             draw_cam_panel(
                 frame_bgr,
                 raw_gesture,
@@ -634,6 +817,8 @@ def run_pre_takeoff_preview(
                 yunet_error=yunet_load_error,
                 trust_line=trust_hud,
                 beh_line=beh_line,
+                hand_bbox_color=hand_bbox_color,
+                gesture_zone_y=zone_line_y,
             )
             cv2.putText(
                 frame_bgr,
@@ -658,10 +843,67 @@ def run_pre_takeoff_preview(
         return False
 
 
+_TEST_YAW_RC = 15
+_TEST_YAW_DURATION_S = 2.0
+_TEST_YAW_RC_INTERVAL_S = 0.05
+
+
+def _run_test_yaw_mode(args: argparse.Namespace) -> int:
+    """Connect only; send fixed positive yaw RC briefly for bench sign check."""
+    print(
+        "\n=== --test-yaw (bench yaw sign) ===\n"
+        "Motors may spin — props on, drone secured, clear area, eye protection.\n"
+        f"No takeoff, no stream. Commands: rc0 0 0 {_TEST_YAW_RC} for "
+        f"{_TEST_YAW_DURATION_S:.1f} s (~{1.0 / _TEST_YAW_RC_INTERVAL_S:.0f} Hz), "
+        "then rc 0 0 0 0.\n"
+        "From above, note whether the nose turns clockwise or counterclockwise "
+        "for positive yaw.\n",
+        flush=True,
+    )
+    input("Press Enter to CONNECT…")
+    tello = SafeTello()
+    try:
+        tello.connect()
+        bat = tello.get_battery()
+        tmp = tello.get_temperature()
+        print(f"Battery: {bat}%   Temp: {tmp}°C", flush=True)
+        if bat < args.min_battery:
+            print(f"Aborting: battery < {args.min_battery}%", flush=True)
+            return 2
+        print(
+            f"Sending rc 0 0 0 {_TEST_YAW_RC} for {_TEST_YAW_DURATION_S:.1f} s…",
+            flush=True,
+        )
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < _TEST_YAW_DURATION_S:
+            tello.send_rc_control(0, 0, 0, _TEST_YAW_RC)
+            time.sleep(_TEST_YAW_RC_INTERVAL_S)
+        print("Sending rc 0 0 0 0", flush=True)
+        tello.send_rc_control(0, 0, 0, 0)
+    except KeyboardInterrupt:
+        print("\n  Interrupted — sending zero RC and disconnecting.", flush=True)
+        try:
+            tello.send_rc_control(0, 0, 0, 0)
+        except Exception:
+            pass
+        return 130
+    finally:
+        try:
+            tello.end()
+        except Exception:
+            pass
+    print("--test-yaw done.", flush=True)
+    return 0
+
+
 def main() -> int:
     global _stop_requested
     args = parse_args()
     signal.signal(signal.SIGINT, _on_sigint)
+
+    if args.test_yaw:
+        logging.getLogger("djitellopy").setLevel(logging.WARNING)
+        return _run_test_yaw_mode(args)
 
     rc_thread: threading.Thread | None = None
     shutdown_rc: threading.Event | None = None
@@ -669,6 +911,10 @@ def main() -> int:
     latest_yaw_holder: list[int] | None = None
 
     try:
+        print(
+            "Heavy imports finished. Initializing perception (YOLO + classifier + YuNet)…",
+            flush=True,
+        )
         perception = tello_view.init_perception(args)
     except Exception as e:
         print(f"ERROR: perception init failed: {e}", file=sys.stderr)
@@ -684,8 +930,8 @@ def main() -> int:
     print("\n=== Tello real autonomy v1 (yaw-only) ===")
     print("Join TELLO Wi-Fi, clear volume around drone, keep hands clear during takeoff.")
     print(
-        "Flow: preview [T] -> climb -> takeoff -> IDLE -> fist=SEARCH; thumbs_up=move_up; palm=land "
-        "(thumbs/FACE_LOCK too)."
+        "Flow: preview [T] -> climb -> takeoff -> IDLE -> fist=SEARCH; thumbs_up=move_up; "
+        "two_fingers=move_forward (20cm); palm=land (thumbs/FACE_LOCK too)."
     )
     print("In flight: OPEN PALM (confirmed) to land; Q / Ctrl+C lands.")
     input("Press Enter to CONNECT (no takeoff yet)...")
@@ -730,12 +976,15 @@ def main() -> int:
     )
 
     airborne = False
-    acq_streak = 0
-    loss_streak = 0
+    face_good_since: float | None = None
+    face_bad_since: float | None = None
+    last_face_x_norm: float | None = None
+    search_direction_from_face = False
     settle_deadline = 0.0
     last_land_fire = 0.0
     last_start_search_time = 0.0
     last_move_up_time = 0.0
+    last_move_forward_time = 0.0
     telem_timer = time.time()
     prev_time = time.time()
     fps = 0.0
@@ -767,7 +1016,7 @@ def main() -> int:
 
     print(
         "\nPreview closed. Takeoff is next: put the video window aside and use this console.\n"
-        "Press Enter to TAKEOFF — **IDLE** until **fist** starts SEARCH; **thumbs_up** climbs."
+        "Press Enter to TAKEOFF — **IDLE** until **fist** starts SEARCH; **thumbs_up** climbs; **two_fingers** moves forward 20cm."
     )
     input()
 
@@ -806,13 +1055,14 @@ def main() -> int:
             daemon=True,
             name="tello_rc",
         )
+        logging.getLogger("djitellopy").setLevel(logging.WARNING)
         rc_thread.start()
         assert command_queue is not None and result_queue is not None
 
         _flight_print(
             flight_t0,
             f"  Takeoff issued — settling {args.settle_s:.1f}s with zero RC, then **IDLE** "
-            f"(fist->SEARCH, thumbs_up->move_up {args.thumbs_up_cm}cm).",
+            f"(fist->SEARCH, thumbs_up->move_up {args.thumbs_up_cm}cm, two_fingers->forward {MOVE_FORWARD_CM}cm).",
             flush=True,
         )
         _flight_print(
@@ -821,13 +1071,25 @@ def main() -> int:
             + (
                 f" ({args.search_cw_degrees}° / {args.search_cw_interval:.2f}s, sign={'cw' if args.search_yaw_rc >= 0 else 'ccw'})"
                 if args.search_mode == "cw"
-                else f" (yaw_rc={args.search_yaw_rc})"
+                else (
+                    f" (cold_yaw_rc={args.search_yaw_rc:+d} recovery_yaw_rc={args.search_yaw_rc_recovery:+d})"
+                )
             ),
             flush=True,
         )
 
         last_search_cw_time = 0.0
         last_climb_reset_time = None  # time.monotonic() after successful MOVE_UP_DONE + reset_after_climb
+        search_entry_first_frame = False
+        search_settle_since: float | None = None
+        search_face_ok_prev = False
+        search_spin_last_logged: tuple[str, int] | None = None
+        pending_reacquire_after_loss_search = False
+        face_lock_loss_log_armed = False
+        face_lock_stable_ok_since: float | None = None
+        face_lock_ok_was_true_last = False
+        prev_face_lock_x_norm = 0.0
+        prev_face_lock_time = time.monotonic()
 
         while True:
             frame_bgr = frame_reader.frame
@@ -872,6 +1134,16 @@ def main() -> int:
                     if msg[1]:
                         gfilter.reset_after_climb()
                         last_climb_reset_time = time.monotonic()
+                elif msg[0] == "MOVE_FORWARD_DONE":
+                    _flight_print(
+                        flight_t0,
+                        f"  [result] MOVE_FORWARD_DONE success={msg[1]}",
+                        flush=True,
+                    )
+                    move_pending.clear()
+                    if msg[1]:
+                        gfilter.reset_after_climb()
+                        last_climb_reset_time = time.monotonic()
                 elif msg[0] == "LAND_DONE":
                     _flight_print(
                         flight_t0,
@@ -896,7 +1168,10 @@ def main() -> int:
             face_score = 0.0
             if face_detector is not None:
                 yunet_frame_i += 1
-                if yunet_frame_i % YUNET_FRAME_STRIDE == 0 or cached_face_pack is None:
+                if (
+                    yunet_frame_i % AUTONOMY_YUNET_FRAME_STRIDE == 0
+                    or cached_face_pack is None
+                ):
                     fb, sc = detect_largest_face(
                         face_detector,
                         frame_bgr,
@@ -919,6 +1194,10 @@ def main() -> int:
             frame_diag["trust_phase"] = "gate_off"
 
             behavior_allow = bool(frame_diag.get("behavior_allow", hand_crop is not None))
+            hand_zone_ok = _hand_center_in_gesture_zone(
+                bbox, fh, args.gesture_zone_top_frac
+            )
+            gesture_for_filter = behavior_allow and hand_zone_ok
 
             raw_gesture = "No hand"
             confidence = 0.0
@@ -932,14 +1211,14 @@ def main() -> int:
             feed = (
                 raw_gesture
                 if (
-                    behavior_allow
+                    gesture_for_filter
                     and hand_crop is not None
                     and confidence >= CONFIDENCE_THRESHOLD
                 )
                 else None
             )
             gesture = (
-                gfilter.update(feed, confidence if behavior_allow else 0.0) or "No hand"
+                gfilter.update(feed, confidence if gesture_for_filter else 0.0) or "No hand"
             )
             cmd_gesture = gesture
 
@@ -990,6 +1269,34 @@ def main() -> int:
                                 f"  [!] queue MOVE_UP (thumbs_up) failed: {e}",
                                 flush=True,
                             )
+                if gfilter.confirmed == "two_fingers" and (
+                    now - last_move_forward_time
+                ) >= COMMAND_COOLDOWN:
+                    if _may_enqueue_discretionary_move(
+                        command_busy, command_queue, move_pending
+                    ):
+                        fwd_cm = _sdk_move_dist_cm(MOVE_FORWARD_CM, MAX_SDK_MOVE_CM)
+                        _flight_print(
+                            flight_t0,
+                            f"  Forward trigger: two_fingers (confirmed) -> queue MOVE_FORWARD {fwd_cm} cm",
+                            flush=True,
+                        )
+                        try:
+                            command_queue.put(("MOVE_FORWARD", fwd_cm), timeout=0.5)
+                            move_pending.set()
+                            last_move_forward_time = now
+                        except queue.Full:
+                            _flight_print(
+                                flight_t0,
+                                "  [!] command_queue full — MOVE_FORWARD not queued",
+                                flush=True,
+                            )
+                        except Exception as e:
+                            _flight_print(
+                                flight_t0,
+                                f"  [!] queue MOVE_FORWARD (two_fingers) failed: {e}",
+                                flush=True,
+                            )
 
             if state == "IDLE":
                 if gfilter.confirmed == "fist" and (now - last_start_search_time) >= COMMAND_COOLDOWN:
@@ -999,10 +1306,24 @@ def main() -> int:
                         flush=True,
                     )
                     state = "SEARCH"
-                    acq_streak = 0
-                    loss_streak = 0
+                    face_good_since = None
+                    face_bad_since = None
+                    last_face_x_norm = None
+                    search_direction_from_face = False
+                    search_settle_since = None
+                    search_face_ok_prev = False
+                    search_spin_last_logged = None
+                    search_entry_first_frame = True
+                    pending_reacquire_after_loss_search = False
                     last_search_cw_time = now - args.search_cw_interval
                     last_start_search_time = now
+                    _flight_print(
+                        flight_t0,
+                        f"  SEARCH SPIN arm — mode={args.search_mode} "
+                        f"cold_yaw_rc={args.search_yaw_rc:+d} recovery_yaw_rc={args.search_yaw_rc_recovery:+d} "
+                        f"direction_from_face=0",
+                        flush=True,
+                    )
 
             if state == "LAND":
                 try:
@@ -1027,6 +1348,7 @@ def main() -> int:
                 break
 
             yaw_rc = 0
+            search_phase_label = ""
             if state == "TAKEOFF":
                 yaw_rc = 0
                 if now >= settle_deadline:
@@ -1065,11 +1387,11 @@ def main() -> int:
                             climb_pending_cm = 0
                     if climb_pending_cm == 0:
                         state = "IDLE"
-                        acq_streak = 0
-                        loss_streak = 0
+                        face_good_since = None
+                        face_bad_since = None
                         _flight_print(
                             flight_t0,
-                            "  State -> IDLE (fist->SEARCH; thumbs_up->up; palm->land)",
+                            "  State -> IDLE (fist->SEARCH; thumbs_up->up; two_fingers->fwd; palm->land)",
                             flush=True,
                         )
                 else:
@@ -1080,64 +1402,279 @@ def main() -> int:
                 _publish_yaw_rc(rc_lock, latest_yaw_holder, 0)
 
             elif state == "SEARCH":
+                mono = time.monotonic()
                 yaw_rc = 0
-                if args.search_mode == "cw":
-                    _publish_yaw_rc(rc_lock, latest_yaw_holder, 0)
-                    if now - last_search_cw_time >= args.search_cw_interval:
-                        deg = args.search_cw_degrees
-                        try:
-                            if args.search_yaw_rc >= 0:
-                                tello.rotate_clockwise(deg)
-                            else:
-                                tello.rotate_counter_clockwise(deg)
-                        except Exception as e:
-                            _flight_print(
-                                flight_t0,
-                                f"  [!] SEARCH cw/ccw failed: {e}",
-                                flush=True,
-                            )
-                        last_search_cw_time = time.time()
-                else:
-                    yaw_rc = _clamp_rc(args.search_yaw_rc)
-                    _publish_yaw_rc(rc_lock, latest_yaw_holder, yaw_rc)
-                if face_ok:
-                    acq_streak += 1
-                    if acq_streak >= M_ACQUIRE:
-                        state = "FACE_LOCK"
-                        acq_streak = 0
-                        loss_streak = 0
+
+                if search_settle_since is not None and not face_ok:
+                    _flight_print(
+                        flight_t0,
+                        f"  SEARCH SETTLE cancel — face lost at elapsed="
+                        f"{mono - search_settle_since:.3f}s / T_settle={T_FACE_SETTLE_S:.3f}s → SPIN",
+                        flush=True,
+                    )
+                    search_settle_since = None
+                    search_spin_last_logged = None
+
+                if face_good_since is not None and not face_ok:
+                    _flight_print(
+                        flight_t0,
+                        f"  SEARCH ACQ cancel — face lost at elapsed="
+                        f"{mono - face_good_since:.3f}s / T_acquire={T_FACE_ACQUIRE_S:.3f}s → SPIN",
+                        flush=True,
+                    )
+                    face_good_since = None
+                    search_spin_last_logged = None
+
+                if search_entry_first_frame:
+                    search_entry_first_frame = False
+                    if face_ok:
+                        search_settle_since = mono
+                        face_good_since = None
                         _flight_print(
                             flight_t0,
-                            "  State -> FACE_LOCK",
+                            f"  SEARCH SETTLE start — from=search_entry T_settle={T_FACE_SETTLE_S:.3f}s "
+                            f"face_x_norm={face_x_norm:+.2f} (yaw_rc forced 0, skipping initial spin)",
                             flush=True,
                         )
+
+                if not face_ok:
+                    search_phase_label = "SPIN"
+                    if args.search_mode == "cw":
+                        _publish_yaw_rc(rc_lock, latest_yaw_holder, 0)
+                        deg = args.search_cw_degrees
+                        spin_tup: tuple[str, int] = (
+                            "cw",
+                            1 if args.search_yaw_rc >= 0 else -1,
+                        )
+                        if search_spin_last_logged != spin_tup:
+                            _flight_print(
+                                flight_t0,
+                                f"  SEARCH SPIN — mode=cw step={deg}° interval={args.search_cw_interval:.2f}s "
+                                f"sign={'cw' if args.search_yaw_rc >= 0 else 'ccw'} "
+                                f"cold_yaw_rc={args.search_yaw_rc:+d} (sign only; recovery N/A cw)",
+                                flush=True,
+                            )
+                            search_spin_last_logged = spin_tup
+                        if now - last_search_cw_time >= args.search_cw_interval:
+                            try:
+                                if args.search_yaw_rc >= 0:
+                                    tello.rotate_clockwise(deg)
+                                else:
+                                    tello.rotate_counter_clockwise(deg)
+                            except Exception as e:
+                                _flight_print(
+                                    flight_t0,
+                                    f"  [!] SEARCH cw/ccw failed: {e}",
+                                    flush=True,
+                                )
+                            last_search_cw_time = time.time()
+                    else:
+                        yaw_rc, spin_kind = _search_rc_spin_yaw_and_kind(
+                            args,
+                            search_direction_from_face,
+                            last_face_x_norm,
+                        )
+                        spin_tup = (spin_kind, yaw_rc)
+                        if search_spin_last_logged != spin_tup:
+                            _flight_print(
+                                flight_t0,
+                                f"  SEARCH SPIN — using={spin_kind} yaw_rc={yaw_rc:+d} "
+                                f"cold={args.search_yaw_rc:+d} recovery={args.search_yaw_rc_recovery:+d} "
+                                f"dir_from_face={int(search_direction_from_face)}",
+                                flush=True,
+                            )
+                            search_spin_last_logged = spin_tup
+                        _publish_yaw_rc(rc_lock, latest_yaw_holder, yaw_rc)
                 else:
-                    acq_streak = 0
+                    last_face_x_norm = face_x_norm
+                    if (
+                        search_settle_since is None
+                        and face_good_since is None
+                        and not search_face_ok_prev
+                    ):
+                        search_settle_since = mono
+                        _flight_print(
+                            flight_t0,
+                            f"  SEARCH SETTLE start — from=edge T_settle={T_FACE_SETTLE_S:.3f}s "
+                            f"face_x_norm={face_x_norm:+.2f} (yaw_rc forced 0)",
+                            flush=True,
+                        )
+
+                    if search_settle_since is not None:
+                        search_phase_label = "SETTLE"
+                        if mono - search_settle_since >= T_FACE_SETTLE_S:
+                            if face_good_since is None:
+                                settle_elapsed = mono - search_settle_since
+                                _flight_print(
+                                    flight_t0,
+                                    f"  SEARCH SETTLE complete — elapsed={settle_elapsed:.3f}s "
+                                    f"face_x_norm={face_x_norm:+.2f} → ACQ",
+                                    flush=True,
+                                )
+                                face_good_since = mono
+                                search_settle_since = None
+                                _flight_print(
+                                    flight_t0,
+                                    f"  SEARCH ACQ start — T_acquire={T_FACE_ACQUIRE_S:.3f}s "
+                                    f"face_x_norm={face_x_norm:+.2f} (post-settle)",
+                                    flush=True,
+                                )
+                                search_phase_label = "ACQ"
+
+                    if face_good_since is not None and search_settle_since is None:
+                        search_phase_label = "ACQ"
+                        if mono - face_good_since >= T_FACE_ACQUIRE_S:
+                            acq_elapsed = mono - face_good_since
+                            state = "FACE_LOCK"
+                            face_good_since = None
+                            face_bad_since = None
+                            search_direction_from_face = False
+                            prev_face_lock_x_norm = 0.0
+                            prev_face_lock_time = time.monotonic()
+                            face_lock_loss_log_armed = True
+                            face_lock_stable_ok_since = None
+                            face_lock_ok_was_true_last = False
+                            total_pipe = T_FACE_SETTLE_S + acq_elapsed
+                            if pending_reacquire_after_loss_search:
+                                _flight_print(
+                                    flight_t0,
+                                    f"  Face re-acquired after directional search — "
+                                    f"settle={T_FACE_SETTLE_S:.3f}s acq={acq_elapsed:.3f}s "
+                                    f"total_pipeline={total_pipe:.3f}s",
+                                    flush=True,
+                                )
+                                pending_reacquire_after_loss_search = False
+                            _flight_print(
+                                flight_t0,
+                                f"  FACE_LOCK acquired — settle={T_FACE_SETTLE_S:.3f}s "
+                                f"acq={acq_elapsed:.3f}s total_pipeline={total_pipe:.3f}s "
+                                f"face_x_norm={face_x_norm:+.2f} (post-settle handoff)",
+                                flush=True,
+                            )
+                    yaw_rc = 0
+                    _publish_yaw_rc(rc_lock, latest_yaw_holder, 0)
+
+                search_face_ok_prev = face_ok
 
             elif state == "FACE_LOCK":
+                mono = time.monotonic()
                 if face_ok:
-                    loss_streak = 0
+                    face_bad_since = None
+                    if not face_lock_ok_was_true_last:
+                        face_lock_stable_ok_since = mono
+                    face_lock_ok_was_true_last = True
+                    if (
+                        face_lock_stable_ok_since is not None
+                        and mono - face_lock_stable_ok_since
+                        >= FACE_LOCK_LOSS_LOG_ARM_DWELL_S
+                    ):
+                        face_lock_loss_log_armed = True
+                    last_face_x_norm = face_x_norm
                     ex = face_x_norm
                     if abs(ex) > EPS_X:
-                        rate_rad = -KP_LOCK * ex
+                        delta_t = mono - prev_face_lock_time
+                        if delta_t > _FACE_LOCK_D_DELTA_T_MIN:
+                            d_error = (ex - prev_face_lock_x_norm) / delta_t
+                        else:
+                            d_error = 0.0
+                        rate_rad = (
+                            KP_LOCK_FACE * ex + KD_LOCK_FACE * d_error
+                        )
                         rate_rad = max(-MAX_ANG_LOCK, min(MAX_ANG_LOCK, rate_rad))
                         yaw_rc = int(
                             round((rate_rad / MAX_ANG_LOCK) * float(args.lock_yaw_max_rc))
                         )
                         yaw_rc = _clamp_rc(yaw_rc)
+                        prev_face_lock_x_norm = ex
+                        prev_face_lock_time = mono
                     else:
                         yaw_rc = 0
+                        prev_face_lock_x_norm = ex
+                        prev_face_lock_time = mono
                 else:
-                    loss_streak += 1
+                    face_lock_ok_was_true_last = False
+                    if face_bad_since is None:
+                        face_bad_since = mono
+                        if face_lock_loss_log_armed:
+                            lxn_s = (
+                                f"{last_face_x_norm:+.2f}"
+                                if last_face_x_norm is not None
+                                else "n/a"
+                            )
+                            _flight_print(
+                                flight_t0,
+                                f"  Face lost in FACE_LOCK — starting loss timer, "
+                                f"last_x_norm={lxn_s}",
+                                flush=True,
+                            )
+                            face_lock_loss_log_armed = False
                     yaw_rc = 0
-                    if loss_streak >= M_LOSS:
-                        state = "SEARCH"
-                        acq_streak = 0
-                        loss_streak = 0
-                        last_search_cw_time = now - args.search_cw_interval
+                    if (
+                        face_bad_since is not None
+                        and mono - face_bad_since >= T_FACE_LOSS_S
+                    ):
+                        loss_elapsed = mono - face_bad_since
+                        if args.search_mode == "cw":
+                            sdir = "default"
+                        elif last_face_x_norm is None:
+                            sdir = "default"
+                        elif abs(last_face_x_norm) <= EPS_X:
+                            sdir = "default"
+                        else:
+                            sdir = "right" if last_face_x_norm > 0 else "left"
                         _flight_print(
                             flight_t0,
-                            "  State -> SEARCH (face loss)",
+                            f"  FACE_LOCK lost — loss_time={loss_elapsed:.3f}s, "
+                            f"search_direction={sdir}",
+                            flush=True,
+                        )
+                        if args.search_mode != "cw":
+                            if (
+                                last_face_x_norm is not None
+                                and abs(last_face_x_norm) > EPS_X
+                            ):
+                                rot = (
+                                    "right"
+                                    if last_face_x_norm > 0
+                                    else "left"
+                                )
+                                _flight_print(
+                                    flight_t0,
+                                    f"  SEARCH direction: rotating {rot} based on "
+                                    f"last_face_x_norm={last_face_x_norm:+.2f} "
+                                    f"cold_yaw_rc={args.search_yaw_rc:+d} "
+                                    f"recovery_yaw_rc={args.search_yaw_rc_recovery:+d}",
+                                    flush=True,
+                                )
+                            else:
+                                _flight_print(
+                                    flight_t0,
+                                    "  SEARCH direction: default "
+                                    "(last_x_norm unknown or near zero)",
+                                    flush=True,
+                                )
+                        state = "SEARCH"
+                        face_good_since = None
+                        face_bad_since = None
+                        search_settle_since = None
+                        search_face_ok_prev = False
+                        search_spin_last_logged = None
+                        if args.search_mode != "cw":
+                            search_direction_from_face = True
+                            pending_reacquire_after_loss_search = sdir in (
+                                "left",
+                                "right",
+                            )
+                        else:
+                            search_direction_from_face = False
+                            pending_reacquire_after_loss_search = False
+                        last_search_cw_time = now - args.search_cw_interval
+                        search_entry_first_frame = True
+                        _flight_print(
+                            flight_t0,
+                            f"  SEARCH SPIN arm — mode={args.search_mode} "
+                            f"cold_yaw_rc={args.search_yaw_rc:+d} recovery_yaw_rc={args.search_yaw_rc_recovery:+d} "
+                            f"direction_from_face={int(search_direction_from_face)}",
                             flush=True,
                         )
 
@@ -1148,24 +1685,59 @@ def main() -> int:
             trust_hud = None
             if state == "IDLE":
                 search_note = (
-                    f"fist->SEARCH thumbs->{args.thumbs_up_cm}cm palm->LAND (confirmed)"
+                    f"fist->SEARCH thumbs->{args.thumbs_up_cm}cm peace->{MOVE_FORWARD_CM}cm palm->LAND"
                 )
             elif state == "SEARCH" and args.search_mode == "cw":
-                search_note = f"SEARCH=cw {args.search_cw_degrees}deg/{args.search_cw_interval:.2f}s"
+                search_note = (
+                    f"SEARCH[{search_phase_label}] cw "
+                    f"{args.search_cw_degrees}deg/{args.search_cw_interval:.2f}s"
+                )
             elif state == "SEARCH":
-                search_note = f"SEARCH=rc yaw={last_yaw_rc}"
+                search_note = f"SEARCH[{search_phase_label}] rc yaw={last_yaw_rc}"
             else:
                 search_note = f"yaw_rc={last_yaw_rc}"
+            mono_hud = time.monotonic()
+            settle_hud = (
+                f"{mono_hud - search_settle_since:.2f}"
+                if state == "SEARCH" and search_settle_since is not None
+                else "-"
+            )
+            acq_hud = (
+                f"{mono_hud - face_good_since:.2f}"
+                if state == "SEARCH" and face_good_since is not None
+                else "-"
+            )
+            loss_hud = (
+                f"{mono_hud - face_bad_since:.2f}"
+                if state == "FACE_LOCK" and not face_ok and face_bad_since is not None
+                else "-"
+            )
+            gz_note = (
+                "gest off"
+                if args.gesture_zone_top_frac >= 1.0
+                else (
+                    "hand low"
+                    if bbox is not None and hand_crop is not None and not hand_zone_ok
+                    else f"gz {args.gesture_zone_top_frac:.0%}"
+                )
+            )
             beh_line = (
                 f"{state}: {search_note} | "
-                f"acq={acq_streak}/{M_ACQUIRE} loss={loss_streak}/{M_LOSS} | "
-                f"f_ok={int(face_ok)} x={face_x_norm:+.2f} | bat={battery}%"
+                f"settle_t={settle_hud}/{T_FACE_SETTLE_S}s "
+                f"acq_t={acq_hud}/{T_FACE_ACQUIRE_S}s loss_t={loss_hud}/{T_FACE_LOSS_S}s | "
+                f"f_ok={int(face_ok)} x={face_x_norm:+.2f} | {gz_note} | bat={battery}%"
             )
             hud_streak_ratio = None
             if last_climb_reset_time is not None and (
                 time.monotonic() - last_climb_reset_time
             ) < CLIMB_HUD_STREAK_CLEAR_S:
                 hud_streak_ratio = 0.0
+            hand_bbox_color = (
+                (96, 96, 96)
+                if bbox is not None and hand_crop is not None and not hand_zone_ok
+                else None
+            )
+            zone_line_y = _gesture_zone_line_y(fh, args.gesture_zone_top_frac)
             draw_cam_panel(
                 frame_bgr,
                 raw_gesture,
@@ -1185,11 +1757,25 @@ def main() -> int:
                 trust_line=trust_hud,
                 beh_line=beh_line,
                 hud_streak_ratio=hud_streak_ratio,
+                hand_bbox_color=hand_bbox_color,
+                gesture_zone_y=zone_line_y,
             )
+            if (
+                face_fb is not None
+                and state in ("SEARCH", "FACE_LOCK")
+            ):
+                fx1, fy1, fx2, fy2 = (int(v) for v in face_fb[:4])
+                cv2.rectangle(
+                    frame_bgr, (fx1, fy1), (fx2, fy2), (0, 165, 255), 2
+                )
             if state == "IDLE":
-                foot = "[Q] land  fist->SEARCH  thumbs->up  palm=LAND"
+                foot = (
+                    f"[Q] land  fist->SEARCH  thumbs->{args.thumbs_up_cm}cm  peace->fwd {MOVE_FORWARD_CM}cm  palm=LAND"
+                )
             elif state in ("SEARCH", "FACE_LOCK"):
-                foot = f"[Q] land  thumbs->up {args.thumbs_up_cm}cm  palm=LAND"
+                foot = (
+                    f"[Q] land  thumbs->{args.thumbs_up_cm}cm  peace->{MOVE_FORWARD_CM}cm fwd  palm=LAND"
+                )
             else:
                 foot = "[Q] land   palm (confirmed)=land"
             cv2.putText(

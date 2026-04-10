@@ -410,7 +410,7 @@ def draw_cam_panel(frame, raw_gesture, gesture, confidence, bbox, command, fps, 
                    source_label="", battery=None, temp=None,
                    follow_preview=False, face_proximity=None, face_tracked=False,
                    yunet_error=None, trust_line=None, beh_line=None,
-                   hud_streak_ratio=None):
+                   hud_streak_ratio=None, hand_bbox_color=None, gesture_zone_y=None):
     h, w = frame.shape[:2]
     hud_extra = (28 if trust_line else 0) + (28 if beh_line else 0)
     core_h = (138 if follow_preview else 128) + hud_extra
@@ -504,9 +504,23 @@ def draw_cam_panel(frame, raw_gesture, gesture, confidence, bbox, command, fps, 
             bar_color = COMMAND_COLORS.get(cmd_key, (100, 100, 100))
             cv2.rectangle(frame, (0, bar_y), (fill, bar_y + bar_h), bar_color, -1)
 
+    if gesture_zone_y is not None and 0 <= gesture_zone_y < h:
+        cv2.line(
+            frame,
+            (0, gesture_zone_y),
+            (w - 1, gesture_zone_y),
+            (100, 200, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
     if bbox is not None:
         x1, y1, x2, y2 = bbox
-        color = COMMAND_COLORS.get(command, (0, 200, 0))
+        color = (
+            hand_bbox_color
+            if hand_bbox_color is not None
+            else COMMAND_COLORS.get(command, (0, 200, 0))
+        )
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
     return frame

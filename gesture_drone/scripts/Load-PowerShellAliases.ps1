@@ -71,7 +71,8 @@ function global:tello-realtest {
 
 function global:tello-autonomy {
     $py = Get-MlxPython
-    & $py (Join-Path $script:MLxScripts "tello_real_autonomy_v1.py") @args
+    # -u unbuffered; launcher prints before importing torch/YOLO (avoids "silent hang" on cold start).
+    & $py -u (Join-Path $script:MLxScripts "tello_autonomy_launcher.py") @args
 }
 
 function global:mlx-help {
@@ -91,7 +92,7 @@ MLxDrone commands (after loading Load-PowerShellAliases.ps1):
 
   tello              Tello camera HUD only (no ROS)
   tello-realtest     Real Tello: takeoff → hover → you type land (djitellopy, no ROS)
-  tello-autonomy     Real Tello v1: SEARCH → FACE_LOCK (yaw) → open palm land (no ROS)
+  tello-autonomy     Real Tello v1 (via launcher: message before slow torch/YOLO import)
 
 Repo: $($script:MLxRepo)
 

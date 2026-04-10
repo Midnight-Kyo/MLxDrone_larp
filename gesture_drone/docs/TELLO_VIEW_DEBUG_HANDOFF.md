@@ -2,15 +2,15 @@
 
 Send this file + a **full console log** + `git rev-parse HEAD` when asking for help.
 
-## 1. Is `--enhance-stream` actually reaching Python?
+## 1. Are CLI flags actually reaching Python?
 
 After the `====` banner, **`tello_view.py` always prints:**
 
 ```text
-  [flags] enhance_stream=True|False  (...)
+  [flags] autonomy_preview=True|False  (...)
 ```
 
-- **`enhance_stream=False`** but you typed `tello --enhance-stream` → the **wrapper did not forward arguments** (wrong profile function, shadowed `tello` command, or old script).
+- **`autonomy_preview=False`** but you typed `tello --autonomy-preview` → the **wrapper did not forward arguments** (wrong profile function, shadowed `tello` command, or old script).
 
 **Fix checklist:**
 
@@ -33,12 +33,10 @@ After the `====` banner, **`tello_view.py` always prints:**
 
    ```powershell
    cd <repo>\gesture_drone\scripts
-   python .\tello_view.py --enhance-stream
-   # or short flag:
-   python .\tello_view.py -E
+   python .\tello_view.py --autonomy-preview
    ```
 
-   If this shows `enhance_stream=True` and the cyan **ENHANCED** badge, the problem is only PowerShell forwarding — use the updated `Load-PowerShellAliases.ps1` (`ValueFromRemainingArguments`).
+   If this shows `autonomy_preview=True`, the problem is only PowerShell forwarding — use the updated `Load-PowerShellAliases.ps1` (`ValueFromRemainingArguments`).
 
 ## 2. UTF-8 decode error on first `command`
 
@@ -61,18 +59,9 @@ The Ryze Tello **command/response channel is UDP**; answers can **get out of ord
 - Power-cycle the drone, connect Wi‑Fi, try again.
 - Some firmware accepts **`setresolution high`** but not **`setfps` / `setbitrate`** — stream may still work at default quality.
 
-## 4. ENHANCED badge missing when `enhance_stream=True`
+## 4. Gesture model “5 classes” in the log
 
-- Must be on **`tello_view.py` revision** that draws the badge **after** `draw_cam_panel` (top-left cyan label).
-- If the flag is **True** but no badge: confirm you are running the script from the **same clone** you updated (`python -c "import pathlib; print(pathlib.Path('tello_view.py').resolve())"` from `gesture_drone\scripts`).
-
-## 5. Video still looks noisy with enhancement on
-
-`--enhance-stream` is **intentionally light** (bilateral + unsharp on the **full frame**). It will not turn the Tello feed into a studio camera; it only nudges edges/contrast for the detector stack.
-
-## 6. Gesture model “5 classes” in the log
-
-If the classifier checkpoint was trained with five extra/unknown class, the loader will report five names. That is independent of stream enhancement; verify `gesture_model.pt` matches the intended **4-class** flight set if commands look wrong.
+If the classifier checkpoint was trained with five extra/unknown class, the loader will report five names. Verify `gesture_model.pt` matches the intended **4-class** flight set if commands look wrong.
 
 ---
 
@@ -84,7 +73,7 @@ git rev-parse HEAD
 Get-Command tello -All
 python --version
 python .\tello_view.py --help
-python .\tello_view.py -E
+python .\tello_view.py --autonomy-preview
 ```
 
-Copy **all** console output from `tello` / `python ... tello_view.py` including the `[flags] enhance_stream=...` line.
+Copy **all** console output from `tello` / `python ... tello_view.py` including the `[flags] autonomy_preview=...` line.
